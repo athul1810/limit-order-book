@@ -364,6 +364,25 @@ reintroducing the `poll()` indexing bug makes the sanitized server report a
 `heap-buffer-overflow` on the first connection — a bug that, uninstrumented, all 60
 unit tests passed straight through.
 
+## Editor setup
+
+`cmake -S . -B build` emits `build/compile_commands.json`, which is what lets an
+editor's C++ IntelliSense (VSCode's cpptools or clangd) resolve this project's quoted
+`#include "order_book.hpp"`-style headers against `-Iinclude`. Without it, every such
+include is flagged as an error in the editor even though the code builds fine.
+`.vscode/c_cpp_properties.json` and `.vscode/settings.json` point both extensions at
+it; run the build once (see below) and reload the window.
+
+## Recovery is shared, not duplicated
+
+`recoverAndOpenLog()` (`recovery.hpp`/`recovery.cpp`) is the one implementation of
+"load the snapshot if present, replay the log from its sequence, refuse to proceed
+past a torn log, then open the log for continued append starting at the right
+sequence number." Both the CLI and the server call it. It used to be ~50 lines
+duplicated verbatim in `main.cpp` and `server_main.cpp` — two copies of subtle
+persistence logic that could silently drift apart, which is exactly the shape of bug
+that goes unnoticed until a fix lands in one copy and not the other.
+
 ## Roadmap
 
 Rough order of what would come next with more time:
@@ -371,5 +390,3 @@ Rough order of what would come next with more time:
 1. A market data feed, so clients can see the book and not just their own fills
 2. Authentication, which the protocol would need before it could leave loopback
 3. Automatic compaction on a size or age trigger
-4. Deduplicating the recovery sequence, which `main.cpp` and `server_main.cpp`
-   currently each carry their own copy of

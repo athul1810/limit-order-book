@@ -1,9 +1,14 @@
+#include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <unistd.h>  // mkdtemp, rmdir -- POSIX, same as the rest of the project (server.cpp)
+#include <vector>
 
 #include "event_log.hpp"
+#include "recovery.hpp"
 #include "snapshot.hpp"
 #include "wire.hpp"
 
@@ -1206,6 +1211,192 @@ void test_apply_request_reports_rejections_over_the_wire() {
     std::cout << "test_apply_request_reports_rejections_over_the_wire passed\n";
 }
 
+// ---- shared recovery (recovery.hpp) ----
+//
+// The CLI and the server used to each carry their own ~50-line copy of
+// "load the snapshot, replay the log from its sequence, refuse to proceed
+// past a torn log, open the log for continued append". These exercise the
+// single shared implementation directly, on real files, rather than only
+// indirectly through the two mains.
+
+namespace {
+
+std::string makeTempDir() {
+    std::string tmpl = "/tmp/matching_engine_recovery_test_XXXXXX";
+    std::vector<char> buf(tmpl.begin(), tmpl.end());
+    buf.push_back('\0');
+    char* result = ::mkdtemp(buf.data());
+    CHECK(result != nullptr);
+    return std::string(result);
+}
+
+void writeFile(const std::string& path, const std::string& content) {
+    std::ofstream out(path, std::ios::trunc);
+    out << content;
+}
+
+std::string readFile(const std::string& path) {
+    std::ifstream in(path);
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+
+void removeIfExists(const std::string& path) { std::remove(path.c_str()); }
+
+}  // namespace
+
+void test_recover_from_nonexistent_log_starts_empty_and_logs_from_zero() {
+    const std::string dir = makeTempDir();
+    const std::string log_path = dir + "/book.log";
+
+    MatchingEngine engine;
+    RecoveredLog recovered = recoverAndOpenLog(log_path, engine);
+
+    CHECK(recovered.ok);
+    CHECK(!recovered.snapshot_present);
+    CHECK(!recovered.log_present);  // nothing existed to replay
+    CHECK(recovered.records_replayed == 0);
+    CHECK(engine.restingOrderCount() == 0);
+    CHECK(engine.eventLog() == recovered.log.get());  // attached, ready to log
+
+    // The log is nonetheless open for writing, starting at sequence 0.
+    engine.addSymbol("AAPL");
+    CHECK(readFile(log_path) == "0 SYMBOL AAPL\n");
+
+    removeIfExists(log_path);
+    CHECK(::rmdir(dir.c_str()) == 0);
+    std::cout << "test_recover_from_nonexistent_log_starts_empty_and_logs_from_zero passed\n";
+}
+
+void test_recover_from_existing_log_replays_and_continues_sequence() {
+    const std::string dir = makeTempDir();
+    const std::string log_path = dir + "/book.log";
+
+    // Build the log by actually running the engine, the same way the real
+    // log got there, rather than hand-writing a record format that could
+    // drift from what EventLog actually produces.
+    {
+        MatchingEngine seed;
+        RecoveredLog first = recoverAndOpenLog(log_path, seed);
+        CHECK(first.ok);
+        seed.addSymbol("AAPL");
+        seed.addLimitOrder("AAPL", 1, Side::Sell, 100'00, 5);
+        // first.file/first.log go out of scope here, flushing and closing.
+    }
+
+    MatchingEngine restored;
+    RecoveredLog recovered = recoverAndOpenLog(log_path, restored);
+
+    CHECK(recovered.ok);
+    CHECK(!recovered.snapshot_present);
+    CHECK(recovered.log_present);
+    CHECK(recovered.records_replayed == 2);  // SYMBOL + LIMIT
+    CHECK(restored.restingOrderCount() == 1);
+    CHECK(restored.bestAsk("AAPL") == 100'00);
+
+    // Appending must continue the sequence rather than restart it at 0,
+    // which would collide with the two records already in the file.
+    restored.addLimitOrder("AAPL", 2, Side::Buy, 99'00, 3);
+    const std::string content = readFile(log_path);
+    CHECK(content == "0 SYMBOL AAPL\n1 LIMIT AAPL 1 SELL 10000 5 0\n2 LIMIT AAPL 2 BUY 9900 3 0\n");
+
+    removeIfExists(log_path);
+    CHECK(::rmdir(dir.c_str()) == 0);
+    std::cout << "test_recover_from_existing_log_replays_and_continues_sequence passed\n";
+}
+
+void test_recover_from_snapshot_and_log_tail_on_disk() {
+    const std::string dir = makeTempDir();
+    const std::string log_path = dir + "/book.log";
+    const std::string snapshot_path = log_path + ".snapshot";
+
+    {
+        MatchingEngine seed;
+        RecoveredLog first = recoverAndOpenLog(log_path, seed);
+        CHECK(first.ok);
+        seed.addSymbol("AAPL");
+        seed.addLimitOrder("AAPL", 1, Side::Sell, 100'00, 5);
+
+        // Compact by hand: snapshot at the current sequence, then start a
+        // fresh log file continuing from there -- mirroring what the CLI's
+        // COMPACT command does.
+        const std::uint64_t at = first.log->nextSequence();
+        std::ofstream snap_out(snapshot_path, std::ios::trunc);
+        writeSnapshot(snap_out, seed, at);
+        snap_out.close();
+        first.file->close();
+        std::ofstream(log_path, std::ios::trunc).close();  // truncate
+    }
+
+    // A record added after compaction, appended directly (as a real process
+    // restarting after COMPACT would do via recoverAndOpenLog).
+    {
+        MatchingEngine seed2;
+        RecoveredLog reopened = recoverAndOpenLog(log_path, seed2);
+        CHECK(reopened.ok);
+        CHECK(reopened.snapshot_present);
+        seed2.addLimitOrder("AAPL", 2, Side::Buy, 99'00, 3);
+    }
+
+    MatchingEngine restored;
+    RecoveredLog recovered = recoverAndOpenLog(log_path, restored);
+
+    CHECK(recovered.ok);
+    CHECK(recovered.snapshot_present);
+    CHECK(recovered.snapshot_orders_loaded == 1);
+    CHECK(recovered.log_present);
+    CHECK(recovered.records_replayed == 1);  // just the post-compaction LIMIT
+    CHECK(restored.restingOrderCount() == 2);
+    CHECK(restored.bestAsk("AAPL") == 100'00);
+    CHECK(restored.bestBid("AAPL") == 99'00);
+
+    removeIfExists(log_path);
+    removeIfExists(snapshot_path);
+    CHECK(::rmdir(dir.c_str()) == 0);
+    std::cout << "test_recover_from_snapshot_and_log_tail_on_disk passed\n";
+}
+
+void test_recover_refuses_a_truncated_log_on_disk() {
+    const std::string dir = makeTempDir();
+    const std::string log_path = dir + "/book.log";
+
+    writeFile(log_path, "0 SYMBOL AAPL\n1 LIMIT AAPL 1 SELL");  // torn mid-record
+
+    MatchingEngine engine;
+    RecoveredLog recovered = recoverAndOpenLog(log_path, engine);
+
+    CHECK(!recovered.ok);
+    CHECK(recovered.error.find("damaged") != std::string::npos);
+    CHECK(recovered.file == nullptr);  // never opened for append
+    CHECK(recovered.log == nullptr);
+
+    removeIfExists(log_path);
+    CHECK(::rmdir(dir.c_str()) == 0);
+    std::cout << "test_recover_refuses_a_truncated_log_on_disk passed\n";
+}
+
+void test_recover_refuses_an_incomplete_snapshot_on_disk() {
+    const std::string dir = makeTempDir();
+    const std::string log_path = dir + "/book.log";
+    const std::string snapshot_path = log_path + ".snapshot";
+
+    // A snapshot with no END marker, as a crash mid-write would leave.
+    writeFile(snapshot_path, "SNAPSHOT 1 5\nSYMBOL AAPL\n");
+
+    MatchingEngine engine;
+    RecoveredLog recovered = recoverAndOpenLog(log_path, engine);
+
+    CHECK(!recovered.ok);
+    CHECK(recovered.error.find("snapshot") != std::string::npos);
+    CHECK(recovered.file == nullptr);
+    CHECK(recovered.log == nullptr);
+
+    removeIfExists(snapshot_path);
+    CHECK(::rmdir(dir.c_str()) == 0);
+    std::cout << "test_recover_refuses_an_incomplete_snapshot_on_disk passed\n";
+}
+
 }  // namespace
 
 int main() {
@@ -1269,6 +1460,11 @@ int main() {
     test_encode_rejects_an_over_long_symbol();
     test_response_round_trips_with_trades();
     test_apply_request_reports_rejections_over_the_wire();
+    test_recover_from_nonexistent_log_starts_empty_and_logs_from_zero();
+    test_recover_from_existing_log_replays_and_continues_sequence();
+    test_recover_from_snapshot_and_log_tail_on_disk();
+    test_recover_refuses_a_truncated_log_on_disk();
+    test_recover_refuses_an_incomplete_snapshot_on_disk();
 
     std::cout << "\nAll tests passed.\n";
     return 0;

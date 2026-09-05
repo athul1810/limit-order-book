@@ -8,6 +8,7 @@
 
 #include "event_log.hpp"
 #include "matching_engine.hpp"
+#include "recovery.hpp"
 #include "snapshot.hpp"
 
 using namespace matching_engine;
@@ -82,7 +83,8 @@ int main(int argc, char** argv) {
     MatchingEngine engine;
 
     // With a log path, the CLI is durable across restarts: replay what's
-    // already there, then append everything new to the same file.
+    // already there, then append everything new to the same file. Recovery
+    // itself is shared with the server -- see recovery.hpp.
     std::unique_ptr<std::ofstream> log_file;
     std::unique_ptr<EventLog> log;
 
@@ -92,49 +94,23 @@ int main(int argc, char** argv) {
     if (argc > 1) {
         log_path = argv[1];
         snapshot_path = log_path + ".snapshot";
-        const std::string& path = log_path;
 
-        // Recovery is snapshot first, then the log records after it.
-        std::uint64_t resume_from = 0;
-        std::ifstream snapshot_in(snapshot_path);
-        if (snapshot_in) {
-            const SnapshotResult loaded = loadSnapshot(snapshot_in, engine);
-            if (!loaded.ok) {
-                std::cerr << "snapshot at " << snapshot_path
-                           << " is incomplete or unreadable; refusing to start from it.\n";
-                return 1;
-            }
-            resume_from = loaded.next_seq;
-            std::cout << "loaded snapshot: " << loaded.orders_loaded << " orders, sequence "
-                       << resume_from << "\n";
-        }
-
-        ReplayResult recovered;
-        std::ifstream existing(path);
-        if (existing) {
-            recovered = replay(existing, engine, resume_from);
-            std::cout << "replayed " << recovered.applied << " records from " << path << "\n";
-        }
-
-        if (recovered.truncated) {
-            // The torn bytes are still in the file. Appending past them would
-            // produce a log that stops replaying at the same point forever,
-            // quietly losing everything written from here on.
-            std::cerr << "log damaged at line " << recovered.stopped_at_line
-                       << "; refusing to append. Truncate it to the last intact record first.\n";
+        RecoveredLog recovered = recoverAndOpenLog(log_path, engine);
+        if (!recovered.ok) {
+            std::cerr << recovered.error << "\n";
             return 1;
         }
-
-        log_file = std::make_unique<std::ofstream>(path, std::ios::app);
-        if (!*log_file) {
-            std::cerr << "cannot open log for writing: " << path << "\n";
-            return 1;
+        if (recovered.snapshot_present) {
+            std::cout << "loaded snapshot: " << recovered.snapshot_orders_loaded << " orders, sequence "
+                       << recovered.snapshot_next_seq << "\n";
         }
-        // Continue the sequence rather than restarting it at zero. With a
-        // snapshot in play that means the snapshot's sequence plus whatever
-        // the log tail added.
-        log = std::make_unique<EventLog>(*log_file, resume_from + recovered.applied);
-        engine.setEventLog(log.get());
+        if (recovered.log_present) {
+            std::cout << "replayed " << recovered.records_replayed << " records from " << log_path
+                       << "\n";
+        }
+
+        log_file = std::move(recovered.file);
+        log = std::move(recovered.log);
     }
 
     std::string line;

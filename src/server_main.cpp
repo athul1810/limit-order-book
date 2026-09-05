@@ -7,8 +7,8 @@
 
 #include "event_log.hpp"
 #include "matching_engine.hpp"
+#include "recovery.hpp"
 #include "server.hpp"
-#include "snapshot.hpp"
 
 using namespace matching_engine;
 
@@ -33,46 +33,28 @@ int main(int argc, char** argv) {
 
     MatchingEngine engine;
 
-    // Same recovery path as the CLI: snapshot first, then the log records
-    // after it. A server that forgets its book on restart isn't persistent.
+    // Same recovery path as the CLI -- see recovery.hpp. A server that
+    // forgets its book on restart isn't persistent.
     std::unique_ptr<std::ofstream> log_file;
     std::unique_ptr<EventLog> log;
 
     if (!log_path.empty()) {
-        const std::string snapshot_path = log_path + ".snapshot";
-        std::uint64_t resume_from = 0;
-
-        std::ifstream snapshot_in(snapshot_path);
-        if (snapshot_in) {
-            const SnapshotResult loaded = loadSnapshot(snapshot_in, engine);
-            if (!loaded.ok) {
-                std::cerr << "snapshot at " << snapshot_path << " is incomplete; refusing to start\n";
-                return 1;
-            }
-            resume_from = loaded.next_seq;
-            std::cout << "loaded snapshot: " << loaded.orders_loaded << " orders, sequence "
-                       << resume_from << "\n";
-        }
-
-        ReplayResult recovered;
-        std::ifstream existing(log_path);
-        if (existing) {
-            recovered = replay(existing, engine, resume_from);
-            std::cout << "replayed " << recovered.applied << " records from " << log_path << "\n";
-        }
-        if (recovered.truncated) {
-            std::cerr << "log damaged at line " << recovered.stopped_at_line
-                       << "; refusing to append\n";
+        RecoveredLog recovered = recoverAndOpenLog(log_path, engine);
+        if (!recovered.ok) {
+            std::cerr << recovered.error << "\n";
             return 1;
         }
-
-        log_file = std::make_unique<std::ofstream>(log_path, std::ios::app);
-        if (!*log_file) {
-            std::cerr << "cannot open log for writing: " << log_path << "\n";
-            return 1;
+        if (recovered.snapshot_present) {
+            std::cout << "loaded snapshot: " << recovered.snapshot_orders_loaded << " orders, sequence "
+                       << recovered.snapshot_next_seq << "\n";
         }
-        log = std::make_unique<EventLog>(*log_file, resume_from + recovered.applied);
-        engine.setEventLog(log.get());
+        if (recovered.log_present) {
+            std::cout << "replayed " << recovered.records_replayed << " records from " << log_path
+                       << "\n";
+        }
+
+        log_file = std::move(recovered.file);
+        log = std::move(recovered.log);
     }
 
     OrderServer server(engine);
