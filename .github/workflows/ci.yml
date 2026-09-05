@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Don't cancel the other jobs when one fails: when a change breaks only
+      # GCC or only macOS, knowing which ones still pass is the useful part.
+      fail-fast: false
+      matrix:
+        include:
+          # GCC and Clang on Linux use different standard libraries
+          # (libstdc++ vs libc++ headers), which is where missing-include bugs
+          # surface -- they compile fine under whichever one you happened to
+          # develop against.
+          - name: linux-gcc
+            os: ubuntu-latest
+            cc: gcc
+            cxx: g++
+          - name: linux-clang
+            os: ubuntu-latest
+            cc: clang
+            cxx: clang++
+          - name: macos-clang
+            os: macos-latest
+            cc: clang
+            cxx: clang++
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        # Warnings are errors in CI but not locally: a warning should block a
+        # merge without making a work-in-progress build unusable.
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-Wpedantic -Werror"
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Unit tests
+        run: ./build/tests
+
+      - name: Wire protocol integration test
+        # Speaks the protocol independently of the C++ codec, against a real
+        # server over a real socket.
+        run: python3 tests/wire_smoke_test.py ./build/matching_engine_server
+
+      - name: CLI persistence across a restart
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$(mktemp -d)/book.log"
+          printf 'SYMBOL AAPL\nLIMIT AAPL SELL 1 100.5 10\nQUIT\n' \
+            | ./build/matching_engine_cli "$log" > /dev/null
+          # A second process must recover the resting order from the log.
+          out="$(printf 'BOOK AAPL\nQUIT\n' | ./build/matching_engine_cli "$log")"
+          echo "$out" | grep -q 'ask=100.50' \
+            || { echo "state did not survive restart:"; echo "$out"; exit 1; }
+          echo "restart recovery ok"
+
+      - name: Benchmark smoke test
+        # Small run: proves it executes and reports, without making CI slow or
+        # pretending a shared runner produces meaningful latency numbers.
+        run: ./build/benchmark_runner 20000
