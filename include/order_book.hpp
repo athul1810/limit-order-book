@@ -42,6 +42,12 @@ enum class RejectReason {
     InvalidQuantity,
     // Engine-level only: no book is registered for that symbol.
     UnknownSymbol,
+    // Wire-level only, never produced by OrderBook or MatchingEngine
+    // themselves: the connection has not authenticated yet, and the server
+    // requires it to before anything else. See OrderServer in server.hpp.
+    NotAuthenticated,
+    // Wire-level only: an Authenticate attempt presented the wrong token.
+    AuthenticationFailed,
 };
 
 // Human-readable form of a RejectReason, for logs and CLI output.

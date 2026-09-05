@@ -49,6 +49,12 @@ enum class MessageType : std::uint8_t {
     ModifyOrder = 4,
     CancelOrder = 5,
     Response = 6,
+    // Presents a credential on this connection. Only meaningful to
+    // OrderServer, which intercepts it before it ever reaches applyRequest --
+    // the engine itself has no notion of authentication. When the server
+    // does not require authentication at all, this trivially succeeds; see
+    // server.hpp.
+    Authenticate = 7,
 };
 
 // One decoded client request. Fields not used by a given message type are left
@@ -63,6 +69,7 @@ struct Request {
     Price price = 0;
     Quantity quantity = 0;
     ParticipantId participant = kNoParticipant;
+    std::string token;  // Authenticate only: the raw credential, no encoding
 };
 
 struct Response {

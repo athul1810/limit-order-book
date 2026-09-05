@@ -13,6 +13,8 @@ const char* describe(RejectReason reason) {
         case RejectReason::UnknownOrder: return "no such resting order";
         case RejectReason::InvalidQuantity: return "quantity must be greater than zero";
         case RejectReason::UnknownSymbol: return "unknown symbol";
+        case RejectReason::NotAuthenticated: return "not authenticated";
+        case RejectReason::AuthenticationFailed: return "authentication failed";
     }
     return "unknown rejection";
 }

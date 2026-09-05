@@ -17,8 +17,11 @@ import tempfile
 import time
 
 VERSION = 1
-ADD_SYMBOL, LIMIT, MARKET, MODIFY, CANCEL, RESPONSE = 1, 2, 3, 4, 5, 6
-REASONS = {0: "ok", 1: "duplicate-id", 2: "unknown-order", 3: "bad-quantity", 4: "unknown-symbol"}
+ADD_SYMBOL, LIMIT, MARKET, MODIFY, CANCEL, RESPONSE, AUTHENTICATE = 1, 2, 3, 4, 5, 6, 7
+REASONS = {
+    0: "ok", 1: "duplicate-id", 2: "unknown-order", 3: "bad-quantity", 4: "unknown-symbol",
+    5: "not-authenticated", 6: "authentication-failed",
+}
 
 
 def frame(msg_type, correlation, payload):
@@ -51,6 +54,12 @@ def cancel(corr, s, oid):
     return frame(CANCEL, corr, sym(s) + struct.pack(">Q", oid))
 
 
+def authenticate(corr, token):
+    # No symbol prefix here, unlike every other message type: the payload is
+    # just the raw token bytes, with nothing else in front of them.
+    return frame(AUTHENTICATE, corr, token.encode())
+
+
 def read_exactly(sock, n):
     buf = b""
     while len(buf) < n:
@@ -81,9 +90,23 @@ def read_response(sock):
             "unfilled": unfilled, "trades": trades}
 
 
-def start_server(binary, port, log_path, out_path):
+def clean_env(overrides=None):
+    # Strips the two auth-related variables from the ambient environment
+    # before applying `overrides`, so a token left over from the calling
+    # shell -- or from an earlier scenario in this same run -- can never
+    # leak into a server a scenario expects to be running without one.
+    env = dict(os.environ)
+    env.pop("MATCHING_ENGINE_TOKEN", None)
+    env.pop("MATCHING_ENGINE_BIND", None)
+    if overrides:
+        env.update(overrides)
+    return env
+
+
+def start_server(binary, port, log_path, out_path, env_overrides=None):
     out = open(out_path, "w")
-    proc = subprocess.Popen([binary, str(port), log_path], stdout=out, stderr=subprocess.STDOUT)
+    proc = subprocess.Popen([binary, str(port), log_path], stdout=out, stderr=subprocess.STDOUT,
+                            env=clean_env(env_overrides))
     for _ in range(100):
         if os.path.exists(out_path):
             with open(out_path) as f:
@@ -101,6 +124,30 @@ def stop_server(proc, out):
     proc.terminate()
     proc.wait(timeout=5)
     out.close()
+
+
+def expect_start_failure(binary, port, log_path, env_overrides, expected_substring):
+    # For a server that must refuse to start at all (an unsafe bind request):
+    # run it to completion rather than through start_server's "wait for
+    # listening" loop, and check both the exit code and the message.
+    result = subprocess.run([binary, str(port), log_path], env=clean_env(env_overrides),
+                            capture_output=True, text=True, timeout=5)
+    return result.returncode != 0 and expected_substring in (result.stdout + result.stderr)
+
+
+def read_after_close_probe(sock, timeout=2):
+    # Distinguishes "the peer closed the connection" (recv returns b"" right
+    # away) from "the peer left it open with nothing to say" (recv blocks
+    # until our timeout) -- the two outcomes a bare recv() cannot tell apart
+    # without one.
+    sock.settimeout(timeout)
+    try:
+        data = sock.recv(16)
+    except socket.timeout:
+        return "still-open"
+    except OSError:
+        return "closed"
+    return "closed" if data == b"" else "unexpected-data"
 
 
 def free_port():
@@ -195,6 +242,53 @@ def main():
         sock3.sendall(market(30, "AAPL", 200, 0, 3, 9))
         check("survives restart", read_response(sock3)["trades"], [(200, 100, 20025, 3)])
         sock3.close()
+    finally:
+        stop_server(proc, out)
+
+    # ---- authentication ----
+    auth_port = free_port()
+    proc, out = start_server(binary, auth_port, os.path.join(workdir, "auth.log"),
+                             os.path.join(workdir, "auth.out"),
+                             env_overrides={"MATCHING_ENGINE_TOKEN": "s3cr3t-token"})
+    try:
+        s = socket.create_connection(("127.0.0.1", auth_port), timeout=5)
+        s.sendall(add_symbol(1, "AAPL"))
+        check("unauthenticated request rejected", read_response(s)["reason"], "not-authenticated")
+
+        s.sendall(authenticate(2, "wrong-token"))
+        check("wrong token rejected", read_response(s)["reason"], "authentication-failed")
+        check("connection closed after wrong token", read_after_close_probe(s), "closed")
+        s.close()
+
+        # A fresh connection, with the right token this time.
+        s2 = socket.create_connection(("127.0.0.1", auth_port), timeout=5)
+        s2.sendall(authenticate(3, "s3cr3t-token"))
+        check("correct token accepted", read_response(s2)["reason"], "ok")
+        s2.sendall(add_symbol(4, "AAPL"))
+        check("request after authenticating", read_response(s2)["reason"], "ok")
+        s2.close()
+    finally:
+        stop_server(proc, out)
+
+    # A non-loopback bind must be refused when no token is configured --
+    # otherwise authentication existing at all would not stop the server
+    # from being reachable, unauthenticated, from the network.
+    refused = expect_start_failure(binary, free_port(), os.path.join(workdir, "refuse.log"),
+                                   {"MATCHING_ENGINE_BIND": "0.0.0.0"},
+                                   "authentication is not configured")
+    check("non-loopback bind refused without a token", refused, True)
+
+    # ...but a token unlocks it. 0.0.0.0 also accepts a loopback connection,
+    # which is what this checks without needing a second, non-loopback NIC.
+    bind_port = free_port()
+    proc, out = start_server(binary, bind_port, os.path.join(workdir, "bind.log"),
+                             os.path.join(workdir, "bind.out"),
+                             env_overrides={"MATCHING_ENGINE_TOKEN": "s3cr3t-token",
+                                            "MATCHING_ENGINE_BIND": "0.0.0.0"})
+    try:
+        s3 = socket.create_connection(("127.0.0.1", bind_port), timeout=5)
+        s3.close()
+        check("non-loopback bind with a token accepts a connection", True, True)
     finally:
         stop_server(proc, out)
 

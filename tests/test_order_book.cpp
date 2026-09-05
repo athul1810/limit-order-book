@@ -1214,6 +1214,87 @@ void test_apply_request_reports_rejections_over_the_wire() {
     std::cout << "test_apply_request_reports_rejections_over_the_wire passed\n";
 }
 
+// ---- authentication (wire.hpp's MessageType::Authenticate) ----
+
+void test_authenticate_round_trips_the_raw_token() {
+    // A char array, not assigned through operator=(const char*): that
+    // assignment goes through strlen() and would truncate at the embedded
+    // nul below before this test ever got to exercise anything. sizeof - 1
+    // keeps every byte the literal actually wrote, embedded nul included,
+    // while dropping only the compiler's own trailing terminator.
+    static const char kRawToken[] = "a token with spaces and \0 an embedded nul";
+
+    Request request;
+    request.type = MessageType::Authenticate;
+    request.correlation_id = 42;
+    request.token.assign(kRawToken, sizeof(kRawToken) - 1);
+    // Exactly what a length-prefixed payload survives and a length implied
+    // by a nul terminator (like the symbol field) would not -- the reason
+    // Authenticate carries no such field.
+    CHECK(request.token.find('\0') != std::string::npos);
+
+    std::vector<std::uint8_t> bytes;
+    CHECK(encodeRequest(request, bytes));
+
+    FrameReader reader;
+    reader.append(bytes.data(), bytes.size());
+    MessageType type;
+    std::uint32_t correlation_id = 0;
+    std::vector<std::uint8_t> payload;
+    CHECK(reader.next(type, correlation_id, payload));
+    CHECK(type == MessageType::Authenticate);
+
+    Request decoded;
+    CHECK(decodeRequest(type, correlation_id, payload.data(), payload.size(), decoded));
+    CHECK(decoded.correlation_id == 42);
+    CHECK(decoded.token == request.token);
+    std::cout << "test_authenticate_round_trips_the_raw_token passed\n";
+}
+
+void test_authenticate_with_an_empty_token_round_trips() {
+    Request request;
+    request.type = MessageType::Authenticate;
+    request.correlation_id = 1;
+    // request.token left as its default-constructed "" -- an empty frame is
+    // the case most likely to trip a null-pointer edge case in decoding.
+
+    std::vector<std::uint8_t> bytes;
+    CHECK(encodeRequest(request, bytes));
+    CHECK(bytes.size() == kHeaderBytes);  // header only, zero-byte payload
+
+    FrameReader reader;
+    reader.append(bytes.data(), bytes.size());
+    MessageType type;
+    std::uint32_t correlation_id = 0;
+    std::vector<std::uint8_t> payload;
+    CHECK(reader.next(type, correlation_id, payload));
+    CHECK(payload.empty());
+
+    Request decoded;
+    CHECK(decodeRequest(type, correlation_id, payload.data(), payload.size(), decoded));
+    CHECK(decoded.token.empty());
+    std::cout << "test_authenticate_with_an_empty_token_round_trips passed\n";
+}
+
+// applyRequest never actually sees a live Authenticate request -- OrderServer
+// intercepts it first, since the engine has no notion of connections or
+// credentials -- but its switch still has to handle the type, so this pins
+// down what that unreachable-in-practice branch does.
+void test_apply_request_does_not_understand_authenticate() {
+    MatchingEngine engine;
+    Request request;
+    request.type = MessageType::Authenticate;
+    request.token = "irrelevant-here";
+    CHECK(applyRequest(request, engine).reason != RejectReason::None);
+    std::cout << "test_apply_request_does_not_understand_authenticate passed\n";
+}
+
+void test_reject_reason_describe_covers_auth_reasons() {
+    CHECK(std::string(describe(RejectReason::NotAuthenticated)) == "not authenticated");
+    CHECK(std::string(describe(RejectReason::AuthenticationFailed)) == "authentication failed");
+    std::cout << "test_reject_reason_describe_covers_auth_reasons passed\n";
+}
+
 // ---- shared recovery (recovery.hpp) ----
 //
 // The CLI and the server used to each carry their own ~50-line copy of
@@ -1580,6 +1661,10 @@ int main() {
     test_encode_rejects_an_over_long_symbol();
     test_response_round_trips_with_trades();
     test_apply_request_reports_rejections_over_the_wire();
+    test_authenticate_round_trips_the_raw_token();
+    test_authenticate_with_an_empty_token_round_trips();
+    test_apply_request_does_not_understand_authenticate();
+    test_reject_reason_describe_covers_auth_reasons();
     test_recover_from_nonexistent_log_starts_empty_and_logs_from_zero();
     test_recover_from_existing_log_replays_and_continues_sequence();
     test_recover_from_snapshot_and_log_tail_on_disk();

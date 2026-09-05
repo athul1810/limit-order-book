@@ -26,6 +26,20 @@ bool setNonBlocking(int fd) {
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
 }
 
+// Compares two byte strings without early-exiting on the first mismatch, so
+// a wrong token takes the same time regardless of how many leading bytes
+// happened to match -- closing the usual timing side channel on a secret
+// comparison. The length check up front still leaks length, not content;
+// that is the standard, accepted trade-off for a check shaped like this one.
+bool constantTimeEquals(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    unsigned char diff = 0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        diff |= static_cast<unsigned char>(a[i]) ^ static_cast<unsigned char>(b[i]);
+    }
+    return diff == 0;
+}
+
 }  // namespace
 
 OrderServer::~OrderServer() {
@@ -35,7 +49,21 @@ OrderServer::~OrderServer() {
     if (listener_ >= 0) ::close(listener_);
 }
 
-bool OrderServer::listenOn(std::uint16_t port, std::string& error) {
+bool OrderServer::listenOn(std::uint16_t port, std::string& error, const std::string& bind_address) {
+    constexpr const char* kLoopback = "127.0.0.1";
+
+    // Binding anywhere but loopback without a token configured would put an
+    // unauthenticated server on the network -- exactly the failure mode
+    // authentication exists to prevent. Checked before any socket is even
+    // opened, so there is nothing to unwind on this path.
+    if (bind_address != kLoopback && !required_token_.has_value()) {
+        // Deliberately caller-agnostic: OrderServer is constructed directly
+        // by tests with no environment involved at all, so this cannot name
+        // a specific env var or flag without being wrong for some caller.
+        error = "refusing to bind " + bind_address + ": authentication is not configured";
+        return false;
+    }
+
     // Writing to a socket the peer has already closed raises SIGPIPE, whose
     // default action is to kill the process. A server must not die because one
     // client hung up mid-response.
@@ -54,8 +82,16 @@ bool OrderServer::listenOn(std::uint16_t port, std::string& error) {
 
     sockaddr_in address{};
     address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);  // loopback only: no auth in this protocol
     address.sin_port = htons(port);
+    if (bind_address == kLoopback) {
+        // The exact original behaviour, kept as its own branch rather than
+        // routed through inet_pton so this specific, always-safe default
+        // path is untouched by adding the general case below.
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    } else if (::inet_pton(AF_INET, bind_address.c_str(), &address.sin_addr) != 1) {
+        error = "invalid bind address: " + bind_address;
+        return false;
+    }
 
     if (::bind(listener_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
         error = std::string("bind: ") + std::strerror(errno);
@@ -130,12 +166,44 @@ bool OrderServer::serviceReadable(Connection& connection) {
             // rather than guess where the next message starts.
             return false;
         }
+
+        if (type == MessageType::Authenticate) {
+            if (!required_token_.has_value() || constantTimeEquals(request.token, *required_token_)) {
+                connection.authenticated = true;
+                queueResponse(connection, correlation_id, RejectReason::None);
+                continue;
+            }
+            // Wrong token: tell the client why, then close the connection.
+            // There is no rate limiting here, so leaving the connection open
+            // for more attempts would make this a free brute-force oracle;
+            // a fresh connection at least costs a TCP handshake per try.
+            queueResponse(connection, correlation_id, RejectReason::AuthenticationFailed);
+            serviceWritable(connection);  // best-effort flush before closing
+            return false;
+        }
+
+        if (required_token_.has_value() && !connection.authenticated) {
+            // Left open, unlike a wrong token above: this connection simply
+            // has not authenticated yet, which by itself is not hostile.
+            queueResponse(connection, correlation_id, RejectReason::NotAuthenticated);
+            continue;
+        }
+
         const Response response = applyRequest(request, engine_);
         encodeResponse(response, connection.outbox);
         ++requests_handled_;
     }
 
     return !connection.reader.failed();
+}
+
+void OrderServer::queueResponse(Connection& connection, std::uint32_t correlation_id,
+                                RejectReason reason) {
+    Response response;
+    response.correlation_id = correlation_id;
+    response.reason = reason;
+    encodeResponse(response, connection.outbox);
+    ++requests_handled_;
 }
 
 bool OrderServer::serviceWritable(Connection& connection) {

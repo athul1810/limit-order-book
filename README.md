@@ -37,6 +37,10 @@ interview, not a black box.
   demand or automatically, on a record-count or wall-clock trigger.
 - **Network access**: a length-prefixed binary protocol over TCP, served by a
   single-threaded `poll()` loop that multiplexes every client onto one matching thread.
+- **Authentication**: an optional shared token, checked on every connection before
+  anything else is accepted. A wrong token closes the connection; no token configured
+  at all leaves it off entirely, and the server refuses to bind anywhere but loopback
+  until one is set.
 
 ## Design
 
@@ -156,9 +160,14 @@ This is a matching core, not a trading system. Missing on purpose, not by oversi
   record, so it survives the process dying, but it is not `fsync`'d, so it does not
   survive the machine dying. Closing that needs a real file descriptor, which is out
   of reach of a `std::ostream`
-- Authentication and encryption on the wire. The server binds to loopback only,
-  because a protocol with no notion of who is connecting has no business on a
-  routable address
+- Encryption on the wire. The token that authentication checks travels in plain text,
+  so it is only meaningfully secret on a link nothing else can observe, which loopback
+  is and a routable network generally is not. Encrypting the connection itself (TLS,
+  most plausibly) is a separate piece of work from checking a credential once it
+  arrives, and is still missing
+- Rate limiting and account lockout on repeated wrong tokens. A failed attempt closes
+  that one connection, but nothing stops a fresh connection from trying again
+  immediately, so this is not a defence against a sustained guessing attack
 - Market data out. The protocol is request/response only: a client learns about its
   own fills and nothing else. A real venue also publishes a book feed
 - Windows. The server uses POSIX sockets and `poll()`
@@ -348,6 +357,46 @@ restart. It found a real bug the C++ tests could not: `poll()` was being indexed
 connection count that `accept()` had already grown, so a newly accepted connection
 read past the end of the descriptor array and was dropped on the spot.
 
+### Authentication
+
+Set `MATCHING_ENGINE_TOKEN` before starting the server to require it:
+
+```bash
+MATCHING_ENGINE_TOKEN=some-shared-secret ./matching_engine_server 9001 book.log
+listening on 127.0.0.1:9001 (authentication required), logging to book.log
+```
+
+A connection has to send an `Authenticate` message, whose payload is the raw token
+and nothing else, before anything else is accepted. Any other request arriving first
+is rejected with `NotAuthenticated`, but the connection stays open, since simply not
+having authenticated yet is not by itself hostile. A wrong token gets rejected with
+`AuthenticationFailed`, and the connection is then closed: there is no rate limiting
+here, so leaving it open for repeated guesses would make the connection a free
+brute-force oracle. A fresh connection can still try again, which at least costs a
+TCP handshake per attempt, not nothing, but not a real defence against a sustained
+attack either.
+
+The token comparison is constant-time (it does not short-circuit on the first
+mismatching byte), which closes the usual timing side-channel on comparing a secret,
+though the check still leaks the two lengths matching or not before that, the
+accepted trade-off for a comparison shaped like this one.
+
+`MATCHING_ENGINE_BIND` sets the address to listen on, defaulting to loopback exactly
+as before. Binding anywhere else is refused unless `MATCHING_ENGINE_TOKEN` is also
+set:
+
+```bash
+MATCHING_ENGINE_BIND=0.0.0.0 ./matching_engine_server 9001
+cannot listen on 0.0.0.0:9001: refusing to bind 0.0.0.0: authentication is not configured
+set MATCHING_ENGINE_TOKEN to allow it.
+
+MATCHING_ENGINE_TOKEN=some-shared-secret MATCHING_ENGINE_BIND=0.0.0.0 ./matching_engine_server 9001
+listening on 0.0.0.0:9001 (authentication required)
+```
+
+Both come from the environment rather than a command-line flag. A secret has no
+business showing up in `ps`, which is where an argv-based flag would put it.
+
 ## Tests and CI
 
 ```bash
@@ -415,7 +464,9 @@ written and installed before the log is ever touched) instead of reusing it.
 
 ## Roadmap
 
-Rough order of what would come next with more time:
+What would come next with more time:
 
 1. A market data feed, so clients can see the book and not just their own fills
-2. Authentication, which the protocol would need before it could leave loopback
+2. Encryption on the wire, so the token authentication checks is not sent in plain
+   text over anything but loopback
+3. Rate limiting on repeated failed authentication attempts

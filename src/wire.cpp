@@ -107,6 +107,8 @@ bool reasonFromByte(std::uint8_t value, RejectReason& out) {
         case 2: out = RejectReason::UnknownOrder; return true;
         case 3: out = RejectReason::InvalidQuantity; return true;
         case 4: out = RejectReason::UnknownSymbol; return true;
+        case 5: out = RejectReason::NotAuthenticated; return true;
+        case 6: out = RejectReason::AuthenticationFailed; return true;
         default: return false;
     }
 }
@@ -118,6 +120,8 @@ std::uint8_t reasonToByte(RejectReason reason) {
         case RejectReason::UnknownOrder: return 2;
         case RejectReason::InvalidQuantity: return 3;
         case RejectReason::UnknownSymbol: return 4;
+        case RejectReason::NotAuthenticated: return 5;
+        case RejectReason::AuthenticationFailed: return 6;
     }
     return 0;
 }
@@ -127,6 +131,15 @@ std::uint8_t reasonToByte(RejectReason reason) {
 bool encodeRequest(const Request& request, std::vector<std::uint8_t>& out) {
     const std::size_t header_at = out.size();
     out.resize(header_at + kHeaderBytes);  // reserved; filled in once the length is known
+
+    // Authenticate has no symbol prefix at all -- its payload is just the raw
+    // token -- so it is handled before the common putSymbol() path every
+    // other message type shares below.
+    if (request.type == MessageType::Authenticate) {
+        out.insert(out.end(), request.token.begin(), request.token.end());
+        writeHeader(out, header_at, request.type, request.correlation_id);
+        return true;
+    }
 
     if (!putSymbol(out, request.symbol)) {
         out.resize(header_at);
@@ -160,6 +173,13 @@ bool encodeRequest(const Request& request, std::vector<std::uint8_t>& out) {
         case MessageType::Response:
             out.resize(header_at);
             return false;  // not a client request
+        case MessageType::Authenticate:
+            // Unreachable: handled above, before putSymbol(). Kept as an
+            // explicit case (rather than a default:) so adding a future
+            // message type here trips -Wswitch instead of silently falling
+            // through.
+            out.resize(header_at);
+            return false;
     }
 
     writeHeader(out, header_at, request.type, request.correlation_id);
@@ -229,6 +249,14 @@ bool decodeRequest(MessageType type, std::uint32_t correlation_id, const std::ui
             out.symbol = getSymbol(payload);
             out.order_id = getU64(payload + 8);
             return !out.symbol.empty();
+        case MessageType::Authenticate:
+            // The whole payload is the raw token; there is no symbol prefix
+            // and no length field of its own, since the frame's own
+            // payload_length already says exactly how many bytes there are.
+            // The empty-string fallback avoids ever calling assign() with a
+            // possibly-null `payload` at length 0.
+            out.token.assign(length == 0 ? "" : reinterpret_cast<const char*>(payload), length);
+            return true;
         case MessageType::Response:
             return false;
     }
@@ -357,6 +385,15 @@ Response applyRequest(const Request& request, MatchingEngine& engine) {
                                   : RejectReason::UnknownOrder;
             return response;
         case MessageType::Response:
+            response.reason = RejectReason::UnknownOrder;
+            return response;
+        case MessageType::Authenticate:
+            // Never actually reaches here in the real server: OrderServer
+            // intercepts Authenticate before calling applyRequest, since the
+            // engine has no notion of connections or credentials. Kept
+            // exhaustive and given the same fallback as Response above,
+            // rather than a default:, so a real future request type here
+            // trips -Wswitch instead of silently reusing this branch.
             response.reason = RejectReason::UnknownOrder;
             return response;
     }

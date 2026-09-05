@@ -3,6 +3,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "compaction.hpp"
@@ -44,6 +45,20 @@ int main(int argc, char** argv) {
         auto_compactor = std::make_unique<AutoCompactor>(*compaction_args.policy);
     }
 
+    // Both come from the environment, not argv: a secret has no business
+    // showing up in `ps`, and keeping the bind address alongside it means
+    // the one thing that gates leaving loopback (a configured token) lives
+    // right next to the setting it gates, with no interaction with the
+    // trailing --auto-compact-* flags above.
+    const char* token_env = std::getenv("MATCHING_ENGINE_TOKEN");
+    const std::optional<std::string> required_token =
+        (token_env != nullptr && *token_env != '\0') ? std::optional<std::string>(token_env)
+                                                       : std::nullopt;
+
+    const char* bind_env = std::getenv("MATCHING_ENGINE_BIND");
+    const std::string bind_address =
+        (bind_env != nullptr && *bind_env != '\0') ? std::string(bind_env) : "127.0.0.1";
+
     MatchingEngine engine;
 
     // Same recovery path as the CLI -- see recovery.hpp. A server that
@@ -71,7 +86,7 @@ int main(int argc, char** argv) {
         log = std::move(recovered.log);
     }
 
-    OrderServer server(engine);
+    OrderServer server(engine, required_token);
 
     // Unlike the CLI, the server has a genuine idle tick (the poll loop's
     // own timeout) independent of request traffic, so a wall-clock trigger
@@ -91,8 +106,11 @@ int main(int argc, char** argv) {
     }
 
     std::string error;
-    if (!server.listenOn(port, error)) {
-        std::cerr << "cannot listen on port " << port << ": " << error << "\n";
+    if (!server.listenOn(port, error, bind_address)) {
+        std::cerr << "cannot listen on " << bind_address << ":" << port << ": " << error << "\n";
+        // OrderServer's message is deliberately caller-agnostic, so the
+        // concrete fix (an env var, specific to this binary) is added here.
+        if (!required_token.has_value()) std::cerr << "set MATCHING_ENGINE_TOKEN to allow it.\n";
         return 1;
     }
 
@@ -100,7 +118,8 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, handleSignal);
     std::signal(SIGTERM, handleSignal);
 
-    std::cout << "listening on 127.0.0.1:" << server.boundPort();
+    std::cout << "listening on " << bind_address << ":" << server.boundPort();
+    if (required_token.has_value()) std::cout << " (authentication required)";
     if (!log_path.empty()) std::cout << ", logging to " << log_path;
     std::cout << "\nCtrl-C to stop.\n";
     std::cout.flush();
