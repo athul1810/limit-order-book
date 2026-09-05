@@ -1,1 +1,274 @@
-# limit-order-book
+# matching-engine
+
+A single-instrument limit order book with price-time priority matching, written in C++17.
+
+This is a from-scratch implementation, not a wrapper around an existing library. The goal
+was a correct, readable core: the kind of thing you could explain line by line in an
+interview, not a black box.
+
+## What it does
+
+- **Limit orders**: match immediately against the opposite side while prices cross;
+  any unfilled remainder rests in the book.
+- **Market orders**: sweep the best available prices until filled or the book side is
+  empty. Never rest — an unfilled market order is simply discarded.
+- **Cancellation**: O(1) average-case removal of a resting order by id.
+- **Cancel-replace**: repoint a resting order at a new price and quantity, keeping
+  its id. Shrinking at an unchanged price keeps queue position; a reprice or a size
+  increase surrenders it, and re-enters the book as a fresh arrival — so repricing
+  aggressively enough to cross will trade immediately.
+- **Duplicate-id rejection**: a submission reusing the id of an order that is
+  still resting is rejected outright, leaving the book untouched. An id becomes
+  free again once its order is cancelled or fully filled.
+- **Price-time priority**: better price always wins; within the same price level,
+  first-in-first-filled.
+- **Exact prices**: prices are integer ticks, so equal prices are always equal —
+  no float drift splitting a price level in two or leaving a crossed book unmatched.
+- **Self-trade prevention**: an incoming order never trades against a resting order
+  belonging to the same participant. Two policies — cancel the resting order and let
+  the aggressor continue (the default), or cancel the aggressor.
+- **Multiple instruments**: a `MatchingEngine` routes orders to a book per symbol.
+- **Persistence**: an append-only write-ahead log of every request, replayable to
+  rebuild engine state exactly. The CLI is durable across restarts.
+- **Compaction**: a point-in-time snapshot bounds both log size and recovery time —
+  recovery becomes "load the snapshot, replay only what came after it".
+
+## Design
+
+- `Price` is an `int64_t` count of ticks (100 ticks to one currency unit), not a
+  `double`. The book compares prices for crossing and uses them as `std::map` keys,
+  so both operations depend on exact equality. With a `double` they aren't exact:
+  `100.00` stepped up ten times by `0.01` is `100.10000000000005`, while the literal
+  `100.10` is `100.09999999999999`. That single-bit gap is enough to open a second
+  price level for what is economically one price, and to leave a buy and a sell at
+  "the same" price sitting crossed in the book without ever matching. The matching
+  core performs no floating-point arithmetic at all; decimals are converted at the
+  I/O boundary, in the CLI.
+- Bids are kept in a `std::map<Price, std::list<Order>, std::greater<Price>>` (best
+  bid first), asks in the same structure ordered ascending (best ask first). A price
+  level is a `std::list` rather than a `std::deque` or `std::vector` so that cancelling
+  an order from the middle of a level doesn't invalidate iterators to any other order.
+- An `unordered_map<OrderId, Location>` tracks where every resting order lives (side,
+  price, list iterator), which is what makes cancellation O(1) average case instead of
+  a linear scan through price levels.
+- Matching walks price levels outward from the best price, consuming resting orders
+  FIFO within a level, until the incoming order is filled or (for limit orders) the
+  next level no longer crosses.
+- Submissions return a `SubmitResult` (`accepted`, `unfilled`, and the trades) rather
+  than a bare trade vector. `accepted` distinguishes a rejected order from an accepted
+  one that simply didn't cross — both produce no trades, but only one changed the book.
+  `unfilled` is the remainder, which means different things for the two order types
+  because they dispose of it differently: a limit order rests it, a market order throws
+  it away. Without it a caller had no way to learn how much of a market order evaporated.
+- Cancel-replace is deliberately built on top of cancel + resubmit rather than splicing
+  the order between levels. Going through `cancelOrder` is what clears the `locations_`
+  entry, and without that the resubmission would be rejected by the duplicate-id check
+  as a collision with the very order being modified. The one case that *doesn't* go
+  through that path is a size reduction at an unchanged price, which is edited in place
+  precisely so it keeps its place in the queue.
+
+- Self-trade prevention has to cancel *something* — letting the trade through would
+  produce a wash trade, and there is no third option — so the policy is an explicit
+  choice rather than a hidden default. `CancelOldest` favours the aggressor and costs
+  the participant the queue position they had earned; `CancelNewest` favours the
+  resting order, and importantly does **not** rest the cancelled remainder, since
+  doing so would leave the participant sitting crossed against their own book.
+- `kNoParticipant` is exempt from self-trade prevention rather than being treated as
+  an ordinary id. It means "ownership not modelled", not "everyone is the same
+  person" — without the exemption every unattributed order would block every other
+  unattributed order.
+- `MatchingEngine` takes the symbol on *every* operation, cancel and modify included.
+  The tempting alternative is a global order-id → symbol index so `cancel(id)` can
+  find its own book, but that index has to stay in step with removals the books make
+  on their own — a resting order being filled, or cancelled by self-trade prevention —
+  which the engine never observes. It would accumulate entries for orders that no
+  longer exist and start rejecting ids that are genuinely free. Carrying the symbol
+  keeps cancellation O(1) with nothing to synchronise, and is what FIX does. The
+  consequence, stated rather than discovered: order ids are unique per symbol, not
+  globally.
+- Instruments are registered up front instead of created on first use, so a typo'd
+  symbol is a rejected order rather than a silently-opened new instrument.
+- The event log stores *requests*, written before they are applied, and stores all of
+  them — including the ones that go on to be rejected. Logging only accepted requests
+  would mean knowing the outcome before writing, which means applying first and
+  logging second, which is precisely the window a write-ahead log exists to close.
+  Replaying the rejected ones is harmless because the engine is deterministic: they
+  are rejected again and change nothing. That same determinism is why the log needs
+  no state snapshot — the request sequence *is* the state.
+- `replay()` detaches whatever log is attached to the engine for its duration. A
+  restart means replaying a log into an engine that is already logging to that same
+  file, and without detaching, every replayed record would be written straight back
+  out — doubling the log on every restart.
+- Records carry a sequence number and replay checks it is contiguous, so a log torn
+  by a process dying mid-write stops recovery at the tear instead of feeding a
+  half-parsed record to the engine. `EventLog` therefore has to be told which sequence
+  number to continue from when appending; restarting the numbering at zero would
+  create a gap that all future replays would stop at.
+- A snapshot has to capture resting orders *in queue order*, because time priority
+  isn't derivable from anything else in the record — and registered symbols
+  separately from their orders, because an instrument with an empty book is still a
+  registered instrument. Nothing else is state: trades are outputs, not something the
+  engine holds. Re-inserting the orders in snapshot order can't produce trades on the
+  way in, because a resting book is never crossed — no bid in it can cross any ask
+  in it.
+- Compaction writes the snapshot first, renames it into place, and only then discards
+  the log. A crash in that window leaves a snapshot at N beside a log that still
+  starts at 0, so `replay()` *skips* records below its start sequence rather than
+  treating them as a gap. That one decision is what makes truncating the log purely
+  an optimisation rather than a step recovery depends on having completed. There is a
+  test that kills the process in exactly that window.
+- Snapshots are written to a temporary and renamed into place, so a crash mid-write
+  can never replace a complete snapshot with half of one. Symbols are serialised in
+  sorted order so identical state produces a byte-identical snapshot.
+
+## What's deliberately left out (for now)
+
+This is a matching core, not a trading system. Missing on purpose, not by oversight:
+
+- Networking / wire protocol (no FIX, no socket layer)
+- Configurable tick size — the tick is a compile-time constant, not a per-instrument
+  property, which is fine while there is exactly one instrument
+- Durability against machine failure — the log is flushed to the stream on every
+  record, so it survives the process dying, but it is not `fsync`'d, so it does not
+  survive the machine dying. Closing that needs a real file descriptor, which is out
+  of reach of a `std::ostream`
+- Automatic compaction — compaction happens when asked for (`COMPACT`), not on a size
+  or age trigger of its own
+- Concurrency — the book is single-threaded by design; a real engine gets its
+  concurrency at the I/O boundary, not inside the matching core itself. Per-symbol
+  books do make the obvious sharding possible (one thread per instrument, nothing
+  shared), but that would be a change to `MatchingEngine`, not a property it has
+
+## Build and run
+
+Requires a C++17 compiler. No external dependencies.
+
+```bash
+# Compile everything directly (no CMake required):
+# The library sources are the same for all three; only the last file differs.
+g++ -std=c++17 -O2 -Iinclude src/order_book.cpp src/matching_engine.cpp \
+    src/event_log.cpp src/snapshot.cpp tests/test_order_book.cpp -o test_runner
+g++ -std=c++17 -O2 -Iinclude src/order_book.cpp src/matching_engine.cpp \
+    src/event_log.cpp src/snapshot.cpp src/main.cpp -o matching_engine_cli
+g++ -std=c++17 -O2 -Iinclude src/order_book.cpp src/matching_engine.cpp \
+    src/event_log.cpp src/snapshot.cpp benchmark/benchmark.cpp -o benchmark_runner
+
+# Or with CMake:
+mkdir build && cd build && cmake .. && make
+```
+
+Run the tests:
+
+```bash
+./test_runner
+```
+
+Try the interactive CLI:
+
+```bash
+./matching_engine_cli
+SYMBOL AAPL
+LIMIT AAPL SELL 1 100.5 10
+LIMIT AAPL BUY 2 100.5 4
+MARKET AAPL BUY 3 8
+LIMIT AAPL BUY 4 99.0 5
+MODIFY AAPL 4 99.5 8
+CANCEL AAPL 4
+```
+
+Rejections say which rule was hit rather than failing silently:
+
+```
+LIMIT NVDA BUY 1 100 5      -> REJECTED: unknown symbol
+LIMIT AAPL BUY 4 99.0 5
+LIMIT AAPL BUY 4 98.0 5     -> REJECTED: duplicate order id
+MODIFY AAPL 4 99.0 0        -> REJECTED: quantity must be greater than zero
+```
+
+Pass a file path and the session becomes durable — every request is logged before
+it is applied, and a later run replays it:
+
+```bash
+./matching_engine_cli book.log
+SYMBOL AAPL
+LIMIT AAPL SELL 1 100.5 10 7
+LIMIT AAPL BUY 2 100.5 4 9
+QUIT
+```
+
+```bash
+./matching_engine_cli book.log
+replayed 3 records from book.log
+BOOK AAPL
+  AAPL: bid=- ask=100.50 resting=1
+```
+
+The log is plain text, one record per line, prices in ticks:
+
+```
+0 SYMBOL AAPL
+1 LIMIT AAPL 1 SELL 10050 10 7
+2 LIMIT AAPL 2 BUY 10050 4 9
+```
+
+If a log is torn — a process killed mid-write — recovery stops at the tear and the
+CLI refuses to append past it rather than producing a log that would silently stop
+replaying at the same point forever.
+
+`COMPACT` writes a snapshot beside the log and truncates it, so neither the file nor
+recovery time grows with total history:
+
+```
+COMPACT
+  compacted at sequence 7: snapshot book.log.snapshot, log truncated
+```
+
+The next run loads the snapshot and replays only what came after:
+
+```
+loaded snapshot: 4 orders, sequence 7
+replayed 2 records from book.log
+```
+
+The last trailing number on `LIMIT` and `MARKET` is an optional participant id,
+which is what self-trade prevention keys on. Here participant 7 never trades with
+themselves, but does trade with participant 9:
+
+```
+LIMIT AAPL SELL 1 100.0 5 7
+LIMIT AAPL BUY  2 100.0 5 7   -> no trade; the resting sell is cancelled
+LIMIT AAPL SELL 3 100.0 5 9   -> trades against 2
+```
+
+Run the benchmark:
+
+```bash
+./benchmark_runner 1000000
+```
+
+It reports two things separately, because they answer different questions:
+
+- **Throughput** — one timer around the whole loop, so per-order clock reads don't
+  inflate it.
+- **Latency** — every `addLimitOrder` timed individually, against a book already
+  warmed to a realistic depth rather than an empty one, reported as p50/p90/p99/p99.9
+  and max. Percentiles are nearest-rank with no interpolation: every number printed
+  is an observation that actually happened.
+
+The cost of two clock reads with no work between them is measured and printed too.
+At these magnitudes it is not a rounding error — it is a meaningful share of the p50,
+so it is reported rather than quietly folded in.
+
+Read the numbers with the obvious caveats: this is a single-threaded process on a
+general-purpose machine, not pinned to a core, with no isolation from the scheduler
+or from allocator behaviour. The tail shows it — the max is routinely three orders of
+magnitude above p99.9, which is the OS and the allocator talking, not the matching
+logic. The percentiles up to p99.9 are the informative part; treat the max as noise
+until it is measured somewhere that can actually control for that.
+
+## Roadmap
+
+Rough order of what would come next with more time:
+
+1. A minimal binary wire protocol + socket server so it can take orders over the
+   network instead of stdin
