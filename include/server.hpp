@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -42,6 +43,16 @@ class OrderServer {
     // Safe to call from a signal handler: it only stores to an atomic flag.
     void stop() { running_ = false; }
 
+    // Invoked once per poll iteration, after that iteration's I/O has been
+    // serviced -- roughly every kPollTimeoutMs at minimum, more often under
+    // load. This is the server's only notion of "meanwhile": there is no
+    // second thread, so background work (automatic compaction on a time
+    // trigger, say) has to be driven from here rather than off a timer.
+    // Exceptions are not caught; a throwing hook takes the server down, on
+    // the theory that a broken background task should be loud, not silently
+    // skipped forever.
+    void setIdleHook(std::function<void()> hook) { idle_hook_ = std::move(hook); }
+
    private:
     struct Connection {
         int fd = -1;
@@ -62,6 +73,7 @@ class OrderServer {
     std::vector<Connection> connections_;
     std::atomic<bool> running_{false};
     std::uint64_t requests_handled_ = 0;
+    std::function<void()> idle_hook_;
 };
 
 }  // namespace matching_engine

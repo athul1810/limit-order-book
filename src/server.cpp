@@ -189,6 +189,12 @@ std::uint64_t OrderServer::runUntilStopped() {
             if (errno == EINTR) continue;  // a signal, including our own stop()
             break;
         }
+
+        // Runs every iteration -- including a bare timeout with nothing
+        // ready -- so a time-based background trigger still fires on an idle
+        // server, not just a busy one.
+        if (idle_hook_) idle_hook_();
+
         if (ready == 0) continue;
 
         if ((fds[0].revents & POLLIN) != 0) acceptPending();

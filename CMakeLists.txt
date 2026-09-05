@@ -19,7 +19,7 @@ add_compile_options(-Wall -Wextra -O2)
 
 include_directories(include)
 
-add_library(order_book src/order_book.cpp src/matching_engine.cpp src/event_log.cpp src/snapshot.cpp src/wire.cpp src/server.cpp src/recovery.cpp)
+add_library(order_book src/order_book.cpp src/matching_engine.cpp src/event_log.cpp src/snapshot.cpp src/wire.cpp src/server.cpp src/recovery.cpp src/compaction.cpp)
 
 add_executable(matching_engine_cli src/main.cpp)
 target_link_libraries(matching_engine_cli order_book)

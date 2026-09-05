@@ -32,8 +32,9 @@ interview, not a black box.
 - **Multiple instruments**: a `MatchingEngine` routes orders to a book per symbol.
 - **Persistence**: an append-only write-ahead log of every request, replayable to
   rebuild engine state exactly. The CLI is durable across restarts.
-- **Compaction**: a point-in-time snapshot bounds both log size and recovery time —
-  recovery becomes "load the snapshot, replay only what came after it".
+- **Compaction**: a point-in-time snapshot bounds both log size and recovery time,
+  turning recovery into "load the snapshot, replay only what came after it". Runs on
+  demand or automatically, on a record-count or wall-clock trigger.
 - **Network access**: a length-prefixed binary protocol over TCP, served by a
   single-threaded `poll()` loop that multiplexes every client onto one matching thread.
 
@@ -155,8 +156,6 @@ This is a matching core, not a trading system. Missing on purpose, not by oversi
   record, so it survives the process dying, but it is not `fsync`'d, so it does not
   survive the machine dying. Closing that needs a real file descriptor, which is out
   of reach of a `std::ostream`
-- Automatic compaction — compaction happens when asked for (`COMPACT`), not on a size
-  or age trigger of its own
 - Authentication and encryption on the wire. The server binds to loopback only,
   because a protocol with no notion of who is connecting has no business on a
   routable address
@@ -178,16 +177,16 @@ Requires a C++17 compiler. No external dependencies.
 # benchmark doesn't touch persistence recovery at all.
 g++ -std=c++17 -O2 -Iinclude src/order_book.cpp src/matching_engine.cpp \
     src/event_log.cpp src/snapshot.cpp src/wire.cpp src/recovery.cpp \
-    tests/test_order_book.cpp -o test_runner
+    src/compaction.cpp tests/test_order_book.cpp -o test_runner
 g++ -std=c++17 -O2 -Iinclude src/order_book.cpp src/matching_engine.cpp \
-    src/event_log.cpp src/snapshot.cpp src/recovery.cpp \
+    src/event_log.cpp src/snapshot.cpp src/recovery.cpp src/compaction.cpp \
     src/main.cpp -o matching_engine_cli
 g++ -std=c++17 -O2 -Iinclude src/order_book.cpp src/matching_engine.cpp \
     src/event_log.cpp src/snapshot.cpp \
     benchmark/benchmark.cpp -o benchmark_runner
 g++ -std=c++17 -O2 -Iinclude src/order_book.cpp src/matching_engine.cpp \
     src/event_log.cpp src/snapshot.cpp src/wire.cpp src/server.cpp \
-    src/recovery.cpp src/server_main.cpp -o matching_engine_server
+    src/recovery.cpp src/compaction.cpp src/server_main.cpp -o matching_engine_server
 
 # Or with CMake, which tracks each target's sources in CMakeLists.txt so this
 # list can't drift the way the commands above can:
@@ -266,6 +265,24 @@ The next run loads the snapshot and replays only what came after:
 loaded snapshot: 4 orders, sequence 7
 replayed 2 records from book.log
 ```
+
+Compaction can also run on its own, so nobody has to remember to type `COMPACT`.
+Pass a trailing flag or two after the log path:
+
+```bash
+./matching_engine_cli book.log --auto-compact-records=5000
+./matching_engine_server 9001 book.log --auto-compact-seconds=300
+```
+
+`--auto-compact-records=N` compacts once N records have accumulated since the last
+compaction; `--auto-compact-seconds=S` compacts once that much time has passed. Both
+can be given together, and either trips it. The two entry points differ in when a
+wall-clock trigger actually gets checked: the server's `poll()` loop has a genuine
+idle tick independent of request traffic, so `--auto-compact-seconds` fires on a
+quiet server exactly as promptly as a busy one. The CLI has no such tick while it is
+blocked on `std::getline` waiting for the next command, so there it is only checked
+after each command runs, meaning a wall-clock trigger there fires on the *next*
+command to arrive after the interval has passed, not the instant it passes.
 
 The last trailing number on `LIMIT` and `MARKET` is an optional participant id,
 which is what self-trade prevention keys on. Here participant 7 never trades with
@@ -388,10 +405,17 @@ duplicated verbatim in `main.cpp` and `server_main.cpp`, two copies of subtle
 persistence logic that could silently drift apart, which is exactly the shape of bug
 that goes unnoticed until a fix lands in one copy and not the other.
 
+Compaction itself (`compaction.hpp`/`compaction.cpp`) followed the same rule from the
+start rather than learning it the hard way: `compact()` is the one place that writes
+a snapshot and truncates the log, and both the manual `COMPACT` command and the
+automatic, policy-driven trigger call it. `AutoCompactor` only decides *when*, not
+*how*; it has no idea what compaction actually does, so a caller wiring in a new
+trigger can never accidentally reimplement the crash-safety ordering (snapshot
+written and installed before the log is ever touched) instead of reusing it.
+
 ## Roadmap
 
 Rough order of what would come next with more time:
 
 1. A market data feed, so clients can see the book and not just their own fills
 2. Authentication, which the protocol would need before it could leave loopback
-3. Automatic compaction on a size or age trigger

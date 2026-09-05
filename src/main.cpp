@@ -1,15 +1,14 @@
 #include <cmath>
-#include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <memory>
 #include <sstream>
 #include <string>
 
+#include "compaction.hpp"
 #include "event_log.hpp"
 #include "matching_engine.hpp"
 #include "recovery.hpp"
-#include "snapshot.hpp"
 
 using namespace matching_engine;
 
@@ -90,10 +89,24 @@ int main(int argc, char** argv) {
 
     std::string log_path;
     std::string snapshot_path;
+    std::unique_ptr<AutoCompactor> auto_compactor;
 
     if (argc > 1) {
         log_path = argv[1];
         snapshot_path = log_path + ".snapshot";
+
+        // Trailing flags, if any: --auto-compact-records=N and/or
+        // --auto-compact-seconds=S. A wall-clock trigger only fires here
+        // when another command actually arrives to check it against -- the
+        // CLI has no periodic tick of its own while blocked on stdin.
+        const CompactionArgsResult compaction_args = parseCompactionPolicyArgs(argc, argv, 2);
+        if (!compaction_args.ok) {
+            std::cerr << compaction_args.error << "\n";
+            return 1;
+        }
+        if (compaction_args.policy.has_value()) {
+            auto_compactor = std::make_unique<AutoCompactor>(*compaction_args.policy);
+        }
 
         RecoveredLog recovered = recoverAndOpenLog(log_path, engine);
         if (!recovered.ok) {
@@ -125,6 +138,8 @@ int main(int argc, char** argv) {
                  "  COMPACT\n"
                  "  QUIT\n"
                  "\nRun with a file path to persist: ./matching_engine_cli book.log\n"
+                 "Add --auto-compact-records=N and/or --auto-compact-seconds=S to compact\n"
+                 "automatically instead of only on an explicit COMPACT.\n"
                  "Instruments must be registered with SYMBOL before they take orders.\n"
                  "Participant is optional; omitting it means anonymous, which is exempt\n"
                  "from self-trade prevention. Order ids are unique per symbol.\n\n";
@@ -180,35 +195,12 @@ int main(int argc, char** argv) {
                 std::cout << "  not logging; start with a log path to enable compaction\n";
                 continue;
             }
-            const std::uint64_t at = log->nextSequence();
-
-            // Write the snapshot to a temporary and rename it into place, so a
-            // crash mid-write can never leave a half-written snapshot where a
-            // complete one used to be.
-            const std::string temp_path = snapshot_path + ".tmp";
-            {
-                std::ofstream snapshot_out(temp_path, std::ios::trunc);
-                if (!snapshot_out) {
-                    std::cout << "  cannot write " << temp_path << "\n";
-                    continue;
-                }
-                writeSnapshot(snapshot_out, engine, at);
-            }
-            if (std::rename(temp_path.c_str(), snapshot_path.c_str()) != 0) {
-                std::cout << "  cannot install snapshot at " << snapshot_path << "\n";
+            const CompactionResult result = compact(engine, snapshot_path, *log, *log_file, log_path);
+            if (!result.ok) {
+                std::cout << "  " << result.error << "\n";
                 continue;
             }
-
-            // Only now discard the log. A crash before this point leaves the
-            // old log intact, which recovery handles by skipping the records
-            // the snapshot already covers.
-            log_file->close();
-            log_file->open(log_path, std::ios::trunc);
-            if (!*log_file) {
-                std::cout << "  snapshot written, but the log could not be truncated\n";
-                continue;
-            }
-            std::cout << "  compacted at sequence " << at << ": snapshot " << snapshot_path
+            std::cout << "  compacted at sequence " << result.sequence << ": snapshot " << snapshot_path
                        << ", log truncated\n";
         } else if (cmd == "BOOK") {
             Symbol symbol;
@@ -216,6 +208,21 @@ int main(int argc, char** argv) {
             printBook(engine, symbol);
         } else {
             std::cout << "  unknown command: " << cmd << "\n";
+        }
+
+        // Checked after every command, since this is the only "meanwhile"
+        // the CLI has -- there is no tick between commands while it is
+        // blocked on the next std::getline.
+        if (auto_compactor != nullptr && log != nullptr) {
+            const auto result = auto_compactor->maybeCompact(engine, snapshot_path, *log, *log_file,
+                                                              log_path);
+            if (result.has_value()) {
+                if (result->ok) {
+                    std::cout << "  auto-compacted at sequence " << result->sequence << "\n";
+                } else {
+                    std::cout << "  auto-compaction failed: " << result->error << "\n";
+                }
+            }
         }
     }
 

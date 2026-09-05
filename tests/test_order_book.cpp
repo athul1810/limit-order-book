@@ -1,12 +1,15 @@
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unistd.h>  // mkdtemp, rmdir -- POSIX, same as the rest of the project (server.cpp)
 #include <vector>
 
+#include "compaction.hpp"
 #include "event_log.hpp"
 #include "recovery.hpp"
 #include "snapshot.hpp"
@@ -1397,6 +1400,123 @@ void test_recover_refuses_an_incomplete_snapshot_on_disk() {
     std::cout << "test_recover_refuses_an_incomplete_snapshot_on_disk passed\n";
 }
 
+// ---- compaction (compaction.hpp) ----
+
+void test_compact_writes_snapshot_and_truncates_log() {
+    const std::string dir = makeTempDir();
+    const std::string log_path = dir + "/book.log";
+    const std::string snapshot_path = log_path + ".snapshot";
+
+    MatchingEngine engine;
+    RecoveredLog recovered = recoverAndOpenLog(log_path, engine);
+    CHECK(recovered.ok);
+    engine.addSymbol("AAPL");
+    engine.addLimitOrder("AAPL", 1, Side::Sell, 100'00, 5);
+
+    const CompactionResult result =
+        compact(engine, snapshot_path, *recovered.log, *recovered.file, log_path);
+
+    CHECK(result.ok);
+    CHECK(result.sequence == 2);  // SYMBOL + LIMIT
+    CHECK(readFile(log_path).empty());  // truncated
+    CHECK(readFile(snapshot_path).find("ORDER AAPL 1 SELL 10000 5 0") != std::string::npos);
+
+    // The log keeps working afterward, continuing the same sequence -- it is
+    // the same EventLog object, reused rather than replaced.
+    engine.addLimitOrder("AAPL", 2, Side::Buy, 99'00, 3);
+    CHECK(readFile(log_path) == "2 LIMIT AAPL 2 BUY 9900 3 0\n");
+
+    removeIfExists(log_path);
+    removeIfExists(snapshot_path);
+    CHECK(::rmdir(dir.c_str()) == 0);
+    std::cout << "test_compact_writes_snapshot_and_truncates_log passed\n";
+}
+
+void test_auto_compactor_triggers_on_record_count() {
+    AutoCompactor compactor(CompactionPolicy{/*max_records=*/3, std::nullopt});
+
+    CHECK(!compactor.shouldCompact(0));
+    CHECK(!compactor.shouldCompact(2));
+    CHECK(compactor.shouldCompact(3));
+    CHECK(compactor.shouldCompact(10));
+    std::cout << "test_auto_compactor_triggers_on_record_count passed\n";
+}
+
+void test_auto_compactor_triggers_on_age() {
+    AutoCompactor compactor(
+        CompactionPolicy{std::nullopt, std::chrono::milliseconds(20)});
+
+    CHECK(!compactor.shouldCompact(0));  // not enough time has passed yet
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    CHECK(compactor.shouldCompact(0));  // sequence unchanged; age alone trips it
+    std::cout << "test_auto_compactor_triggers_on_age passed\n";
+}
+
+void test_auto_compactor_maybe_compact_resets_after_success() {
+    const std::string dir = makeTempDir();
+    const std::string log_path = dir + "/book.log";
+    const std::string snapshot_path = log_path + ".snapshot";
+
+    MatchingEngine engine;
+    RecoveredLog recovered = recoverAndOpenLog(log_path, engine);
+    CHECK(recovered.ok);
+    engine.addSymbol("AAPL");  // sequence 0: 1 record so far
+
+    AutoCompactor compactor(CompactionPolicy{/*max_records=*/2, std::nullopt});
+
+    // Below threshold: nothing happens, and the log is untouched.
+    auto attempt = compactor.maybeCompact(engine, snapshot_path, *recovered.log, *recovered.file,
+                                          log_path);
+    CHECK(!attempt.has_value());
+    CHECK(readFile(log_path) == "0 SYMBOL AAPL\n");
+
+    engine.addLimitOrder("AAPL", 1, Side::Sell, 100'00, 5);  // sequence 1: now 2 records since
+
+    attempt = compactor.maybeCompact(engine, snapshot_path, *recovered.log, *recovered.file, log_path);
+    CHECK(attempt.has_value());
+    CHECK(attempt->ok);
+    CHECK(readFile(log_path).empty());
+
+    // Immediately after a successful compaction, the counter has reset: with
+    // nothing new logged, it must not fire again.
+    attempt = compactor.maybeCompact(engine, snapshot_path, *recovered.log, *recovered.file, log_path);
+    CHECK(!attempt.has_value());
+
+    removeIfExists(log_path);
+    removeIfExists(snapshot_path);
+    CHECK(::rmdir(dir.c_str()) == 0);
+    std::cout << "test_auto_compactor_maybe_compact_resets_after_success passed\n";
+}
+
+void test_parse_compaction_policy_args() {
+    {
+        const char* argv[] = {"prog", "book.log"};
+        auto result = parseCompactionPolicyArgs(2, const_cast<char**>(argv), 2);
+        CHECK(result.ok);
+        CHECK(!result.policy.has_value());  // no flags given
+    }
+    {
+        const char* argv[] = {"prog", "book.log", "--auto-compact-records=500",
+                              "--auto-compact-seconds=60"};
+        auto result = parseCompactionPolicyArgs(4, const_cast<char**>(argv), 2);
+        CHECK(result.ok);
+        CHECK(result.policy.has_value());
+        CHECK(result.policy->max_records.has_value() && *result.policy->max_records == 500);
+        CHECK(result.policy->max_age.has_value() &&
+              *result.policy->max_age == std::chrono::seconds(60));
+    }
+    {
+        // A typo must be reported, not silently treated as "no policy" --
+        // that would leave the caller thinking compaction was configured
+        // when it was not.
+        const char* argv[] = {"prog", "book.log", "--auto-compact-recrods=5"};
+        auto result = parseCompactionPolicyArgs(3, const_cast<char**>(argv), 2);
+        CHECK(!result.ok);
+        CHECK(!result.error.empty());
+    }
+    std::cout << "test_parse_compaction_policy_args passed\n";
+}
+
 }  // namespace
 
 int main() {
@@ -1465,6 +1585,11 @@ int main() {
     test_recover_from_snapshot_and_log_tail_on_disk();
     test_recover_refuses_a_truncated_log_on_disk();
     test_recover_refuses_an_incomplete_snapshot_on_disk();
+    test_compact_writes_snapshot_and_truncates_log();
+    test_auto_compactor_triggers_on_record_count();
+    test_auto_compactor_triggers_on_age();
+    test_auto_compactor_maybe_compact_resets_after_success();
+    test_parse_compaction_policy_args();
 
     std::cout << "\nAll tests passed.\n";
     return 0;

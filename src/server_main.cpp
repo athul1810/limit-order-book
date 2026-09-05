@@ -5,6 +5,7 @@
 #include <memory>
 #include <string>
 
+#include "compaction.hpp"
 #include "event_log.hpp"
 #include "matching_engine.hpp"
 #include "recovery.hpp"
@@ -31,12 +32,25 @@ int main(int argc, char** argv) {
     if (argc > 1) port = static_cast<std::uint16_t>(std::atoi(argv[1]));
     if (argc > 2) log_path = argv[2];
 
+    // Trailing flags after the log path: --auto-compact-records=N and/or
+    // --auto-compact-seconds=S.
+    const CompactionArgsResult compaction_args = parseCompactionPolicyArgs(argc, argv, 3);
+    if (!compaction_args.ok) {
+        std::cerr << compaction_args.error << "\n";
+        return 1;
+    }
+    std::unique_ptr<AutoCompactor> auto_compactor;
+    if (compaction_args.policy.has_value()) {
+        auto_compactor = std::make_unique<AutoCompactor>(*compaction_args.policy);
+    }
+
     MatchingEngine engine;
 
     // Same recovery path as the CLI -- see recovery.hpp. A server that
     // forgets its book on restart isn't persistent.
     std::unique_ptr<std::ofstream> log_file;
     std::unique_ptr<EventLog> log;
+    const std::string snapshot_path = log_path + ".snapshot";
 
     if (!log_path.empty()) {
         RecoveredLog recovered = recoverAndOpenLog(log_path, engine);
@@ -58,6 +72,24 @@ int main(int argc, char** argv) {
     }
 
     OrderServer server(engine);
+
+    // Unlike the CLI, the server has a genuine idle tick (the poll loop's
+    // own timeout) independent of request traffic, so a wall-clock trigger
+    // here actually fires on a quiet server instead of only when a request
+    // happens to arrive.
+    if (auto_compactor != nullptr && log != nullptr) {
+        server.setIdleHook([&]() {
+            const auto result =
+                auto_compactor->maybeCompact(engine, snapshot_path, *log, *log_file, log_path);
+            if (!result.has_value()) return;
+            if (result->ok) {
+                std::cout << "auto-compacted at sequence " << result->sequence << "\n";
+            } else {
+                std::cerr << "auto-compaction failed: " << result->error << "\n";
+            }
+        });
+    }
+
     std::string error;
     if (!server.listenOn(port, error)) {
         std::cerr << "cannot listen on port " << port << ": " << error << "\n";
