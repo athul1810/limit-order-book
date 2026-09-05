@@ -32,6 +32,8 @@ interview, not a black box.
   rebuild engine state exactly. The CLI is durable across restarts.
 - **Compaction**: a point-in-time snapshot bounds both log size and recovery time —
   recovery becomes "load the snapshot, replay only what came after it".
+- **Network access**: a length-prefixed binary protocol over TCP, served by a
+  single-threaded `poll()` loop that multiplexes every client onto one matching thread.
 
 ## Design
 
@@ -121,6 +123,25 @@ interview, not a black box.
   can never replace a complete snapshot with half of one. Symbols are serialised in
   sorted order so identical state produces a byte-identical snapshot.
 
+- The wire protocol is length-prefixed because TCP is a byte stream, not a message
+  stream: one `read()` can deliver half a message, three messages, or two and a half.
+  Every integer is big-endian and written byte by byte — structs are never memcpy'd
+  onto the wire, since their layout depends on the compiler's padding and the host's
+  endianness, neither of which is something two independent builds have agreed on.
+- The payload length is `u32`, not `u16`. A 16-bit length caps a response at roughly
+  2000 trades, and one market order sweeping a deep book can exceed that — a limit
+  that would only ever surface in production, on the largest and most interesting
+  order of the day.
+- The server is single-threaded and that is the design, not a shortcut. Matching is
+  inherently serial: price-time priority is a claim about a total order over arriving
+  orders, so the moment two threads match into one book you need a lock around the
+  whole operation and have bought nothing. Concurrency belongs at the I/O boundary,
+  which is precisely what multiplexing many sockets onto one matching thread gives.
+- Responses are buffered per connection rather than written and assumed sent. A
+  partial write is normal, not an error — the kernel buffer fills and the rest goes
+  out when the socket is writable again — so `POLLOUT` is only requested when there
+  is something pending, or `poll()` would return immediately forever.
+
 ## What's deliberately left out (for now)
 
 This is a matching core, not a trading system. Missing on purpose, not by oversight:
@@ -134,6 +155,12 @@ This is a matching core, not a trading system. Missing on purpose, not by oversi
   of reach of a `std::ostream`
 - Automatic compaction — compaction happens when asked for (`COMPACT`), not on a size
   or age trigger of its own
+- Authentication and encryption on the wire. The server binds to loopback only,
+  because a protocol with no notion of who is connecting has no business on a
+  routable address
+- Market data out. The protocol is request/response only: a client learns about its
+  own fills and nothing else. A real venue also publishes a book feed
+- Windows. The server uses POSIX sockets and `poll()`
 - Concurrency — the book is single-threaded by design; a real engine gets its
   concurrency at the I/O boundary, not inside the matching core itself. Per-symbol
   books do make the obvious sharding possible (one thread per instrument, nothing
@@ -152,6 +179,9 @@ g++ -std=c++17 -O2 -Iinclude src/order_book.cpp src/matching_engine.cpp \
     src/event_log.cpp src/snapshot.cpp src/main.cpp -o matching_engine_cli
 g++ -std=c++17 -O2 -Iinclude src/order_book.cpp src/matching_engine.cpp \
     src/event_log.cpp src/snapshot.cpp benchmark/benchmark.cpp -o benchmark_runner
+g++ -std=c++17 -O2 -Iinclude src/order_book.cpp src/matching_engine.cpp \
+    src/event_log.cpp src/snapshot.cpp src/wire.cpp src/server.cpp \
+    src/server_main.cpp -o matching_engine_server
 
 # Or with CMake:
 mkdir build && cd build && cmake .. && make
@@ -266,9 +296,38 @@ magnitude above p99.9, which is the OS and the allocator talking, not the matchi
 logic. The percentiles up to p99.9 are the informative part; treat the max as noise
 until it is measured somewhere that can actually control for that.
 
+## Over the network
+
+The server takes orders over TCP instead of stdin, with the same persistence:
+
+```bash
+./matching_engine_server 9001 book.log
+listening on 127.0.0.1:9001, logging to book.log
+```
+
+Messages are length-prefixed and big-endian. The header is 12 bytes — payload length
+(`u32`), correlation id (`u32`, echoed back so a client can match replies to requests
+without assuming ordering), message type, version, and two reserved bytes — followed
+by the payload. `wire.hpp` documents each message's layout.
+
+There's an integration test that speaks the protocol from scratch in Python, over a
+real socket, rather than round-tripping through the same C++ codec that wrote it:
+
+```bash
+python3 tests/wire_smoke_test.py ./matching_engine_server
+```
+
+It starts a server on a free port and checks framing (several messages in one write,
+one message split across two writes), self-trade prevention, each rejection reason,
+negative prices, a second connection seeing the same book, and state surviving a
+restart. It found a real bug the C++ tests could not: `poll()` was being indexed by a
+connection count that `accept()` had already grown, so a newly accepted connection
+read past the end of the descriptor array and was dropped on the spot.
+
 ## Roadmap
 
 Rough order of what would come next with more time:
 
-1. A minimal binary wire protocol + socket server so it can take orders over the
-   network instead of stdin
+1. A market data feed, so clients can see the book and not just their own fills
+2. Authentication, which the protocol would need before it could leave loopback
+3. Automatic compaction on a size or age trigger

@@ -5,6 +5,7 @@
 
 #include "event_log.hpp"
 #include "snapshot.hpp"
+#include "wire.hpp"
 
 #include "matching_engine.hpp"
 #include "order_book.hpp"
@@ -921,6 +922,272 @@ void test_recovery_survives_a_crash_between_snapshot_and_truncation() {
     std::cout << "test_recovery_survives_a_crash_between_snapshot_and_truncation passed\n";
 }
 
+// ---- wire protocol ----
+
+namespace {
+
+std::vector<std::uint8_t> encodeAll(const std::vector<Request>& requests) {
+    std::vector<std::uint8_t> bytes;
+    for (const Request& request : requests) {
+        const bool ok = encodeRequest(request, bytes);
+        assert(ok);
+    }
+    return bytes;
+}
+
+Request limitRequest(std::uint32_t correlation, OrderId id, Side side, Price price, Quantity qty,
+                     ParticipantId participant) {
+    Request request;
+    request.type = MessageType::LimitOrder;
+    request.correlation_id = correlation;
+    request.symbol = "AAPL";
+    request.order_id = id;
+    request.side = side;
+    request.price = price;
+    request.quantity = qty;
+    request.participant = participant;
+    return request;
+}
+
+// Feeds `bytes` through a FrameReader in two chunks split at `split`, and
+// returns the decoded requests.
+std::vector<Request> readSplitAt(const std::vector<std::uint8_t>& bytes, std::size_t split) {
+    FrameReader reader;
+    std::vector<Request> decoded;
+    MessageType type;
+    std::uint32_t correlation = 0;
+    std::vector<std::uint8_t> payload;
+
+    reader.append(bytes.data(), split);
+    while (reader.next(type, correlation, payload)) {
+        Request request;
+        assert(decodeRequest(type, correlation, payload.data(), payload.size(), request));
+        decoded.push_back(request);
+    }
+    reader.append(bytes.data() + split, bytes.size() - split);
+    while (reader.next(type, correlation, payload)) {
+        Request request;
+        assert(decodeRequest(type, correlation, payload.data(), payload.size(), request));
+        decoded.push_back(request);
+    }
+    assert(!reader.failed());
+    return decoded;
+}
+
+}  // namespace
+
+void test_wire_round_trips_every_request_type() {
+    Request add;
+    add.type = MessageType::AddSymbol;
+    add.correlation_id = 1;
+    add.symbol = "MSFT";
+
+    Request market;
+    market.type = MessageType::MarketOrder;
+    market.correlation_id = 3;
+    market.symbol = "AAPL";
+    market.order_id = 77;
+    market.side = Side::Sell;
+    market.quantity = 12;
+    market.participant = 5;
+
+    Request modify;
+    modify.type = MessageType::ModifyOrder;
+    modify.correlation_id = 4;
+    modify.symbol = "AAPL";
+    modify.order_id = 77;
+    modify.price = 98'25;
+    modify.quantity = 3;
+
+    Request cancel;
+    cancel.type = MessageType::CancelOrder;
+    cancel.correlation_id = 5;
+    cancel.symbol = "AAPL";
+    cancel.order_id = 77;
+
+    // A negative price is not a valid order, but the field is signed and the
+    // encoding of a negative i64 is exactly where a hand-rolled codec breaks.
+    const std::vector<Request> sent = {add, limitRequest(2, 42, Side::Buy, 100'50, 9, 7), market,
+                                       modify, cancel, limitRequest(6, 1, Side::Buy, -12'34, 1, 0)};
+    const std::vector<Request> got = readSplitAt(encodeAll(sent), 0);
+
+    assert(got.size() == sent.size());
+    for (std::size_t i = 0; i < sent.size(); ++i) {
+        assert(got[i].type == sent[i].type);
+        assert(got[i].correlation_id == sent[i].correlation_id);
+        assert(got[i].symbol == sent[i].symbol);
+        assert(got[i].order_id == sent[i].order_id);
+        assert(got[i].price == sent[i].price);
+        assert(got[i].quantity == sent[i].quantity);
+        assert(got[i].participant == sent[i].participant);
+    }
+    std::cout << "test_wire_round_trips_every_request_type passed\n";
+}
+
+// TCP splits wherever it likes. Rather than sample a few boundaries, split at
+// every single one -- including mid-header and mid-payload -- and require the
+// decoded result to be identical each time.
+void test_framing_is_identical_at_every_possible_split() {
+    const std::vector<Request> sent = {limitRequest(1, 10, Side::Buy, 100'00, 5, 7),
+                                       limitRequest(2, 11, Side::Sell, 101'00, 6, 9),
+                                       limitRequest(3, 12, Side::Buy, 99'00, 7, 0)};
+    const std::vector<std::uint8_t> bytes = encodeAll(sent);
+    assert(bytes.size() > kHeaderBytes * 3);
+
+    for (std::size_t split = 0; split <= bytes.size(); ++split) {
+        const std::vector<Request> got = readSplitAt(bytes, split);
+        assert(got.size() == sent.size());
+        for (std::size_t i = 0; i < sent.size(); ++i) {
+            assert(got[i].correlation_id == sent[i].correlation_id);
+            assert(got[i].order_id == sent[i].order_id);
+            assert(got[i].price == sent[i].price);
+            assert(got[i].quantity == sent[i].quantity);
+        }
+    }
+    std::cout << "test_framing_is_identical_at_every_possible_split passed\n";
+}
+
+void test_framing_yields_nothing_until_a_frame_is_complete() {
+    std::vector<std::uint8_t> bytes;
+    assert(encodeRequest(limitRequest(1, 10, Side::Buy, 100'00, 5, 7), bytes));
+
+    FrameReader reader;
+    MessageType type;
+    std::uint32_t correlation = 0;
+    std::vector<std::uint8_t> payload;
+
+    // One byte short: still nothing, and still not a failure.
+    reader.append(bytes.data(), bytes.size() - 1);
+    assert(!reader.next(type, correlation, payload));
+    assert(!reader.failed());
+
+    reader.append(bytes.data() + bytes.size() - 1, 1);
+    assert(reader.next(type, correlation, payload));
+    assert(!reader.next(type, correlation, payload));  // and only the one
+    std::cout << "test_framing_yields_nothing_until_a_frame_is_complete passed\n";
+}
+
+void test_framing_rejects_bad_version_and_oversized_payloads() {
+    std::vector<std::uint8_t> bytes;
+    assert(encodeRequest(limitRequest(1, 10, Side::Buy, 100'00, 5, 7), bytes));
+
+    {
+        std::vector<std::uint8_t> corrupt = bytes;
+        corrupt[9] = kWireVersion + 1;  // version byte
+        FrameReader reader;
+        MessageType type;
+        std::uint32_t correlation = 0;
+        std::vector<std::uint8_t> payload;
+        reader.append(corrupt.data(), corrupt.size());
+        assert(!reader.next(type, correlation, payload));
+        assert(reader.failed());
+    }
+    {
+        // A client claiming a huge payload must not make the server buffer it.
+        std::vector<std::uint8_t> corrupt = bytes;
+        corrupt[0] = 0xFF;
+        corrupt[1] = 0xFF;
+        corrupt[2] = 0xFF;
+        corrupt[3] = 0xFF;
+        FrameReader reader;
+        MessageType type;
+        std::uint32_t correlation = 0;
+        std::vector<std::uint8_t> payload;
+        reader.append(corrupt.data(), corrupt.size());
+        assert(!reader.next(type, correlation, payload));
+        assert(reader.failed());
+    }
+    std::cout << "test_framing_rejects_bad_version_and_oversized_payloads passed\n";
+}
+
+void test_decode_rejects_wrong_payload_length() {
+    std::vector<std::uint8_t> payload(4, 0);  // far too short for a limit order
+    Request request;
+    assert(!decodeRequest(MessageType::LimitOrder, 1, payload.data(), payload.size(), request));
+
+    // Trailing bytes are rejected too: they mean the ends disagree on format.
+    std::vector<std::uint8_t> bytes;
+    assert(encodeRequest(limitRequest(1, 10, Side::Buy, 100'00, 5, 7), bytes));
+    const std::size_t body = bytes.size() - kHeaderBytes;
+    assert(!decodeRequest(MessageType::LimitOrder, 1, bytes.data() + kHeaderBytes, body + 1, request));
+    std::cout << "test_decode_rejects_wrong_payload_length passed\n";
+}
+
+void test_encode_rejects_an_over_long_symbol() {
+    Request request = limitRequest(1, 10, Side::Buy, 100'00, 5, 7);
+    request.symbol = "TOOLONGSYMBOL";  // truncating would alias two instruments
+    std::vector<std::uint8_t> bytes;
+    assert(!encodeRequest(request, bytes));
+    assert(bytes.empty());  // and nothing half-written is left behind
+    std::cout << "test_encode_rejects_an_over_long_symbol passed\n";
+}
+
+void test_response_round_trips_with_trades() {
+    MatchingEngine engine;
+    engine.addSymbol("AAPL");
+    engine.addLimitOrder("AAPL", 1, Side::Sell, 100'00, 5, kAlice);
+    engine.addLimitOrder("AAPL", 2, Side::Sell, 101'00, 5, kAlice);
+
+    Request sweep;
+    sweep.type = MessageType::MarketOrder;
+    sweep.correlation_id = 99;
+    sweep.symbol = "AAPL";
+    sweep.order_id = 3;
+    sweep.side = Side::Buy;
+    sweep.quantity = 12;
+    sweep.participant = kBob;
+
+    const Response sent = applyRequest(sweep, engine);
+    assert(sent.trades.size() == 2);
+    assert(sent.unfilled == 2);
+
+    std::vector<std::uint8_t> bytes;
+    encodeResponse(sent, bytes);
+
+    FrameReader reader;
+    MessageType type;
+    std::uint32_t correlation = 0;
+    std::vector<std::uint8_t> payload;
+    reader.append(bytes.data(), bytes.size());
+    assert(reader.next(type, correlation, payload));
+    assert(type == MessageType::Response);
+
+    Response got;
+    assert(decodeResponse(correlation, payload.data(), payload.size(), got));
+    assert(got.correlation_id == 99);
+    assert(got.reason == RejectReason::None);
+    assert(got.unfilled == sent.unfilled);
+    assert(got.trades.size() == sent.trades.size());
+    for (std::size_t i = 0; i < sent.trades.size(); ++i) {
+        assert(got.trades[i].buy_order_id == sent.trades[i].buy_order_id);
+        assert(got.trades[i].sell_order_id == sent.trades[i].sell_order_id);
+        assert(got.trades[i].price == sent.trades[i].price);
+        assert(got.trades[i].quantity == sent.trades[i].quantity);
+    }
+    std::cout << "test_response_round_trips_with_trades passed\n";
+}
+
+void test_apply_request_reports_rejections_over_the_wire() {
+    MatchingEngine engine;
+
+    Request unknown = limitRequest(1, 10, Side::Buy, 100'00, 5, 7);  // AAPL not registered
+    Response response = applyRequest(unknown, engine);
+    assert(response.reason == RejectReason::UnknownSymbol);
+    assert(response.unfilled == 5);
+
+    Request add;
+    add.type = MessageType::AddSymbol;
+    add.symbol = "AAPL";
+    assert(applyRequest(add, engine).reason == RejectReason::None);
+    assert(applyRequest(add, engine).reason != RejectReason::None);  // already registered
+
+    assert(applyRequest(limitRequest(2, 10, Side::Buy, 100'00, 5, 7), engine).reason ==
+           RejectReason::None);
+    assert(applyRequest(limitRequest(3, 10, Side::Buy, 99'00, 5, 7), engine).reason ==
+           RejectReason::DuplicateOrderId);
+    std::cout << "test_apply_request_reports_rejections_over_the_wire passed\n";
+}
+
 }  // namespace
 
 int main() {
@@ -976,6 +1243,14 @@ int main() {
     test_snapshot_of_unknown_version_is_rejected();
     test_compaction_recovers_snapshot_plus_log_tail();
     test_recovery_survives_a_crash_between_snapshot_and_truncation();
+    test_wire_round_trips_every_request_type();
+    test_framing_is_identical_at_every_possible_split();
+    test_framing_yields_nothing_until_a_frame_is_complete();
+    test_framing_rejects_bad_version_and_oversized_payloads();
+    test_decode_rejects_wrong_payload_length();
+    test_encode_rejects_an_over_long_symbol();
+    test_response_round_trips_with_trades();
+    test_apply_request_reports_rejections_over_the_wire();
 
     std::cout << "\nAll tests passed.\n";
     return 0;
