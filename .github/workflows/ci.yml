@@ -85,7 +85,7 @@ jobs:
         -fno-omit-frame-pointer -Iinclude
       LIB_SRC: >-
         src/order_book.cpp src/matching_engine.cpp src/event_log.cpp
-        src/snapshot.cpp src/wire.cpp
+        src/snapshot.cpp src/wire.cpp src/recovery.cpp
     steps:
       - uses: actions/checkout@v5
 

@@ -173,19 +173,24 @@ This is a matching core, not a trading system. Missing on purpose, not by oversi
 Requires a C++17 compiler. No external dependencies.
 
 ```bash
-# Compile everything directly (no CMake required):
-# The library sources are the same for all three; only the last file differs.
+# Compile everything directly (no CMake required). Each target only needs the
+# sources it actually uses: the CLI doesn't touch the wire protocol, and the
+# benchmark doesn't touch persistence recovery at all.
 g++ -std=c++17 -O2 -Iinclude src/order_book.cpp src/matching_engine.cpp \
-    src/event_log.cpp src/snapshot.cpp tests/test_order_book.cpp -o test_runner
+    src/event_log.cpp src/snapshot.cpp src/wire.cpp src/recovery.cpp \
+    tests/test_order_book.cpp -o test_runner
 g++ -std=c++17 -O2 -Iinclude src/order_book.cpp src/matching_engine.cpp \
-    src/event_log.cpp src/snapshot.cpp src/main.cpp -o matching_engine_cli
+    src/event_log.cpp src/snapshot.cpp src/recovery.cpp \
+    src/main.cpp -o matching_engine_cli
 g++ -std=c++17 -O2 -Iinclude src/order_book.cpp src/matching_engine.cpp \
-    src/event_log.cpp src/snapshot.cpp benchmark/benchmark.cpp -o benchmark_runner
+    src/event_log.cpp src/snapshot.cpp \
+    benchmark/benchmark.cpp -o benchmark_runner
 g++ -std=c++17 -O2 -Iinclude src/order_book.cpp src/matching_engine.cpp \
     src/event_log.cpp src/snapshot.cpp src/wire.cpp src/server.cpp \
-    src/server_main.cpp -o matching_engine_server
+    src/recovery.cpp src/server_main.cpp -o matching_engine_server
 
-# Or with CMake:
+# Or with CMake, which tracks each target's sources in CMakeLists.txt so this
+# list can't drift the way the commands above can:
 mkdir build && cd build && cmake .. && make
 ```
 
@@ -379,7 +384,7 @@ it; run the build once (see below) and reload the window.
 "load the snapshot if present, replay the log from its sequence, refuse to proceed
 past a torn log, then open the log for continued append starting at the right
 sequence number." Both the CLI and the server call it. It used to be ~50 lines
-duplicated verbatim in `main.cpp` and `server_main.cpp` — two copies of subtle
+duplicated verbatim in `main.cpp` and `server_main.cpp`, two copies of subtle
 persistence logic that could silently drift apart, which is exactly the shape of bug
 that goes unnoticed until a fix lands in one copy and not the other.
 
