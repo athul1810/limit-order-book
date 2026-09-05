@@ -335,15 +335,34 @@ python3 tests/wire_smoke_test.py ./matching_engine_server   # protocol, over a r
 
 CI builds with GCC and Clang on Linux and Clang on macOS, with `-Wpedantic -Werror`,
 and runs the unit tests, the wire integration test, a CLI restart-recovery check, and
-a short benchmark. Three toolchains rather than one because that is where a whole
+a short benchmark. Two further jobs run everything under AddressSanitizer and
+UndefinedBehaviorSanitizer, and fuzz the wire decoder with libFuzzer. Three toolchains rather than one because that is where a whole
 class of bug lives: a standard-library symbol used without including its header
 compiles fine under whichever implementation you happened to develop against, and
 fails on the other. Adding CI turned up six such cases in this repository.
 
-The unit tests use a `CHECK` macro rather than `assert`. `assert` expands to nothing
-when `NDEBUG` is defined, and `NDEBUG` is exactly what a CMake `Release` build
-defines — so an assert-based suite compiled in Release prints "passed" for every test
-while verifying nothing. `CHECK` is evaluated in every build type.
+`tests/fuzz_wire.cpp` targets `FrameReader` and `decodeRequest` — the only code here
+that reads bytes chosen by someone else, since anyone who can open a socket feeds them
+directly. It has two entry points: `LLVMFuzzerTestOneInput` for libFuzzer, and a
+standalone corpus-replay driver so the harness runs under sanitizers on toolchains
+that ship no libFuzzer runtime (Apple clang does not).
+
+Two details in that setup are load-bearing, and both are the same kind of trap:
+
+- Sanitizer builds pass `-fno-sanitize-recover=all`. UBSan's default is to print a
+  diagnostic and keep going, exiting 0 — so a job built without it stays green while
+  reporting real undefined behaviour in its own logs.
+- The unit tests use a `CHECK` macro rather than `assert`.   `assert` expands to nothing when `NDEBUG` is defined, and `NDEBUG` is exactly what
+  a CMake `Release` build defines — so an assert-based suite compiled in Release
+  prints "passed" for every test while verifying nothing. `CHECK` is evaluated in
+  every build type.
+
+Both were verified the only way worth trusting: by breaking something on purpose and
+confirming the check goes red. Removing a length check from the decoder makes the
+fuzzer abort with an ASan `container-overflow` naming the exact line, and
+reintroducing the `poll()` indexing bug makes the sanitized server report a
+`heap-buffer-overflow` on the first connection — a bug that, uninstrumented, all 60
+unit tests passed straight through.
 
 ## Roadmap
 
@@ -352,3 +371,5 @@ Rough order of what would come next with more time:
 1. A market data feed, so clients can see the book and not just their own fills
 2. Authentication, which the protocol would need before it could leave loopback
 3. Automatic compaction on a size or age trigger
+4. Deduplicating the recovery sequence, which `main.cpp` and `server_main.cpp`
+   currently each carry their own copy of

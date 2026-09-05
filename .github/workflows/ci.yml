@@ -72,3 +72,73 @@ jobs:
         # Small run: proves it executes and reports, without making CI slow or
         # pretending a shared runner produces meaningful latency numbers.
         run: ./build/benchmark_runner 20000
+
+  sanitizers:
+    name: sanitizers (asan+ubsan)
+    runs-on: ubuntu-latest
+    env:
+      # -fno-sanitize-recover is load-bearing. UBSan's default is to print a
+      # diagnostic and carry on, exiting 0 -- a job built without this stays
+      # green while reporting real undefined behaviour in its own logs.
+      SAN_FLAGS: >-
+        -std=c++17 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all
+        -fno-omit-frame-pointer -Iinclude
+      LIB_SRC: >-
+        src/order_book.cpp src/matching_engine.cpp src/event_log.cpp
+        src/snapshot.cpp src/wire.cpp
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build instrumented binaries
+        # Explicitly bash: these rely on unquoted word splitting, which bash
+        # does and some other shells (zsh) do not.
+        shell: bash
+        run: |
+          clang++ $SAN_FLAGS $LIB_SRC tests/test_order_book.cpp -o tests_san
+          clang++ $SAN_FLAGS $LIB_SRC src/server.cpp src/server_main.cpp -o server_san
+          clang++ $SAN_FLAGS -DSTANDALONE_FUZZ_DRIVER $LIB_SRC tests/fuzz_wire.cpp -o fuzz_san
+
+      - name: Unit tests
+        run: ./tests_san
+
+      - name: Wire protocol against an instrumented server
+        # The server is where the one memory bug found so far actually lived:
+        # a poll() loop indexed by a connection count accept() had grown. It
+        # read past the end of the descriptor array, every unit test passed,
+        # and ASan names the line immediately.
+        run: python3 tests/wire_smoke_test.py ./server_san
+
+      - name: Fuzz corpus replay
+        run: ./fuzz_san 200000
+
+  fuzz:
+    name: fuzz (libfuzzer)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build fuzz target
+        shell: bash
+        run: |
+          clang++ -std=c++17 -g -O1 \
+            -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all \
+            -fno-omit-frame-pointer -Iinclude \
+            src/order_book.cpp src/matching_engine.cpp src/event_log.cpp \
+            src/snapshot.cpp src/wire.cpp tests/fuzz_wire.cpp -o fuzz_wire
+
+      - name: Fuzz the wire decoder
+        # A short run on every push. This is a regression gate, not a fuzzing
+        # campaign: it catches what is reachable quickly, and -max_total_time
+        # keeps CI honest about how long it takes.
+        run: ./fuzz_wire -max_total_time=60 -print_final_stats=1
+
+      - name: Upload crash inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: |
+            crash-*
+            timeout-*
+            oom-*
+          if-no-files-found: ignore

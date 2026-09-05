@@ -3,3 +3,6 @@ build/
 /test_runner
 /matching_engine_cli
 /benchmark_runner
+/matching_engine_server
+__pycache__/
+*.pyc
