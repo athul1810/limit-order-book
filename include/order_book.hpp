@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <list>
 #include <map>
 #include <optional>

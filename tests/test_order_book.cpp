@@ -1,4 +1,4 @@
-#include <cassert>
+#include <cstdlib>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -12,6 +12,24 @@
 
 using namespace matching_engine;
 
+// Deliberately not CHECK(). CHECK() expands to nothing when NDEBUG is
+// defined, and NDEBUG is exactly what a CMake Release build defines -- so an
+// assert-based suite still prints "passed" for every test while verifying
+// nothing at all. CHECK is always evaluated, in every build type.
+namespace {
+
+void checkFailed(const char* expression, const char* file, int line) {
+    std::cout << "\nCHECK FAILED: " << expression << "\n  at " << file << ":" << line << "\n";
+    std::exit(1);
+}
+
+}  // namespace
+
+#define CHECK(condition)                                       \
+    do {                                                       \
+        if (!(condition)) checkFailed(#condition, __FILE__, __LINE__); \
+    } while (false)
+
 // Prices below are written with a digit separator so they read as
 // dollars-and-cents: 100'00 is $100.00, i.e. 10000 ticks.
 
@@ -22,11 +40,11 @@ void test_basic_match() {
     book.addLimitOrder(1, Side::Sell, 100'00, 10);
     auto trades = book.addLimitOrder(2, Side::Buy, 100'00, 10).trades;
 
-    assert(trades.size() == 1);
-    assert(trades[0].price == 100'00);
-    assert(trades[0].quantity == 10);
-    assert(!book.bestBid().has_value());
-    assert(!book.bestAsk().has_value());
+    CHECK(trades.size() == 1);
+    CHECK(trades[0].price == 100'00);
+    CHECK(trades[0].quantity == 10);
+    CHECK(!book.bestBid().has_value());
+    CHECK(!book.bestAsk().has_value());
     std::cout << "test_basic_match passed\n";
 }
 
@@ -35,10 +53,10 @@ void test_partial_fill_rests_remainder() {
     book.addLimitOrder(1, Side::Sell, 100'00, 5);
     auto trades = book.addLimitOrder(2, Side::Buy, 100'00, 10).trades;
 
-    assert(trades.size() == 1);
-    assert(trades[0].quantity == 5);
-    assert(book.bestBid().has_value() && *book.bestBid() == 100'00);
-    assert(book.restingOrderCount() == 1);
+    CHECK(trades.size() == 1);
+    CHECK(trades[0].quantity == 5);
+    CHECK(book.bestBid().has_value() && *book.bestBid() == 100'00);
+    CHECK(book.restingOrderCount() == 1);
     std::cout << "test_partial_fill_rests_remainder passed\n";
 }
 
@@ -48,8 +66,8 @@ void test_price_priority_beats_time() {
     book.addLimitOrder(2, Side::Sell, 100'00, 5);  // better price, arrived second
     auto trades = book.addLimitOrder(3, Side::Buy, 101'00, 5).trades;
 
-    assert(trades.size() == 1);
-    assert(trades[0].sell_order_id == 2);  // best price fills first regardless of arrival
+    CHECK(trades.size() == 1);
+    CHECK(trades[0].sell_order_id == 2);  // best price fills first regardless of arrival
     std::cout << "test_price_priority_beats_time passed\n";
 }
 
@@ -59,17 +77,17 @@ void test_time_priority_within_same_price() {
     book.addLimitOrder(2, Side::Sell, 100'00, 5);  // arrived second, same price
     auto trades = book.addLimitOrder(3, Side::Buy, 100'00, 5).trades;
 
-    assert(trades.size() == 1);
-    assert(trades[0].sell_order_id == 1);  // first in, first filled
+    CHECK(trades.size() == 1);
+    CHECK(trades[0].sell_order_id == 1);  // first in, first filled
     std::cout << "test_time_priority_within_same_price passed\n";
 }
 
 void test_cancel_removes_order() {
     OrderBook book;
     book.addLimitOrder(1, Side::Buy, 99'00, 5);
-    assert(book.cancelOrder(1));
-    assert(!book.cancelOrder(1));  // already gone
-    assert(!book.bestBid().has_value());
+    CHECK(book.cancelOrder(1));
+    CHECK(!book.cancelOrder(1));  // already gone
+    CHECK(!book.bestBid().has_value());
     std::cout << "test_cancel_removes_order passed\n";
 }
 
@@ -79,9 +97,9 @@ void test_market_order_sweeps_multiple_levels() {
     book.addLimitOrder(2, Side::Sell, 101'00, 5);
     auto trades = book.addMarketOrder(3, Side::Buy, 8).trades;
 
-    assert(trades.size() == 2);
-    assert(trades[0].price == 100'00 && trades[0].quantity == 5);
-    assert(trades[1].price == 101'00 && trades[1].quantity == 3);
+    CHECK(trades.size() == 2);
+    CHECK(trades[0].price == 100'00 && trades[0].quantity == 5);
+    CHECK(trades[1].price == 101'00 && trades[1].quantity == 3);
     std::cout << "test_market_order_sweeps_multiple_levels passed\n";
 }
 
@@ -89,8 +107,8 @@ void test_market_order_never_rests() {
     OrderBook book;
     // No resting sell orders at all -- market buy should just find nothing.
     auto trades = book.addMarketOrder(1, Side::Buy, 100).trades;
-    assert(trades.empty());
-    assert(book.restingOrderCount() == 0);  // unfilled market order is discarded, not resting
+    CHECK(trades.empty());
+    CHECK(book.restingOrderCount() == 0);  // unfilled market order is discarded, not resting
     std::cout << "test_market_order_never_rests passed\n";
 }
 
@@ -99,29 +117,29 @@ void test_limit_order_does_not_cross_worse_price() {
     book.addLimitOrder(1, Side::Sell, 101'00, 5);
     auto trades = book.addLimitOrder(2, Side::Buy, 100'00, 5).trades;  // won't pay 101
 
-    assert(trades.empty());
-    assert(book.bestBid().has_value() && *book.bestBid() == 100'00);
-    assert(book.bestAsk().has_value() && *book.bestAsk() == 101'00);
+    CHECK(trades.empty());
+    CHECK(book.bestBid().has_value() && *book.bestBid() == 100'00);
+    CHECK(book.bestAsk().has_value() && *book.bestAsk() == 101'00);
     std::cout << "test_limit_order_does_not_cross_worse_price passed\n";
 }
 
 void test_duplicate_id_rejected_and_book_untouched() {
     OrderBook book;
-    assert(book.addLimitOrder(1, Side::Buy, 100'00, 5).accepted());
+    CHECK(book.addLimitOrder(1, Side::Buy, 100'00, 5).accepted());
 
     auto dup = book.addLimitOrder(1, Side::Buy, 101'00, 5);  // same id, still resting
-    assert(!dup.accepted());
-    assert(dup.trades.empty());
+    CHECK(!dup.accepted());
+    CHECK(dup.trades.empty());
 
     // The book must look exactly as it did before the rejected submission:
     // one resting order at 100, and no phantom level at 101.
-    assert(book.restingOrderCount() == 1);
-    assert(book.bestBid().has_value() && *book.bestBid() == 100'00);
+    CHECK(book.restingOrderCount() == 1);
+    CHECK(book.bestBid().has_value() && *book.bestBid() == 100'00);
 
     // And the original is still reachable -- the whole point of rejecting.
-    assert(book.cancelOrder(1));
-    assert(book.restingOrderCount() == 0);
-    assert(!book.bestBid().has_value());
+    CHECK(book.cancelOrder(1));
+    CHECK(book.restingOrderCount() == 0);
+    CHECK(!book.bestBid().has_value());
     std::cout << "test_duplicate_id_rejected_and_book_untouched passed\n";
 }
 
@@ -133,14 +151,14 @@ void test_duplicate_id_rejected_for_market_order() {
     // A market buy reusing id 1 would otherwise trade against resting order 1
     // and erase its location entry while it is still in the book.
     auto dup = book.addMarketOrder(1, Side::Buy, 3);
-    assert(!dup.accepted());
-    assert(dup.trades.empty());
-    assert(book.restingOrderCount() == 2);  // nothing consumed
+    CHECK(!dup.accepted());
+    CHECK(dup.trades.empty());
+    CHECK(book.restingOrderCount() == 2);  // nothing consumed
 
     // A fresh id sweeps normally.
     auto ok = book.addMarketOrder(3, Side::Buy, 3);
-    assert(ok.accepted());
-    assert(ok.trades.size() == 1 && ok.trades[0].quantity == 3);
+    CHECK(ok.accepted());
+    CHECK(ok.trades.size() == 1 && ok.trades[0].quantity == 3);
     std::cout << "test_duplicate_id_rejected_for_market_order passed\n";
 }
 
@@ -149,15 +167,15 @@ void test_id_is_reusable_once_no_longer_resting() {
 
     // Retired by cancellation.
     book.addLimitOrder(1, Side::Buy, 100'00, 5);
-    assert(book.cancelOrder(1));
-    assert(book.addLimitOrder(1, Side::Buy, 99'00, 5).accepted());
-    assert(book.bestBid().has_value() && *book.bestBid() == 99'00);
+    CHECK(book.cancelOrder(1));
+    CHECK(book.addLimitOrder(1, Side::Buy, 99'00, 5).accepted());
+    CHECK(book.bestBid().has_value() && *book.bestBid() == 99'00);
 
     // Retired by being fully filled.
     book.addLimitOrder(2, Side::Sell, 99'00, 5);  // consumes order 1 completely
-    assert(book.restingOrderCount() == 0);
-    assert(book.addLimitOrder(1, Side::Buy, 98'00, 5).accepted());
-    assert(book.restingOrderCount() == 1);
+    CHECK(book.restingOrderCount() == 0);
+    CHECK(book.addLimitOrder(1, Side::Buy, 98'00, 5).accepted());
+    CHECK(book.restingOrderCount() == 1);
     std::cout << "test_id_is_reusable_once_no_longer_resting passed\n";
 }
 
@@ -167,11 +185,11 @@ void test_fully_filled_incoming_order_does_not_reserve_its_id() {
 
     // Order 2 crosses fully, so it never rests and never enters locations_.
     auto trades = book.addLimitOrder(2, Side::Buy, 100'00, 5).trades;
-    assert(trades.size() == 1);
-    assert(book.restingOrderCount() == 0);
+    CHECK(trades.size() == 1);
+    CHECK(book.restingOrderCount() == 0);
 
     // Its id must therefore be immediately available again.
-    assert(book.addLimitOrder(2, Side::Buy, 95'00, 5).accepted());
+    CHECK(book.addLimitOrder(2, Side::Buy, 95'00, 5).accepted());
     std::cout << "test_fully_filled_incoming_order_does_not_reserve_its_id passed\n";
 }
 
@@ -182,15 +200,15 @@ void test_fully_filled_incoming_order_does_not_reserve_its_id() {
 void test_arithmetic_price_crosses_literal_price() {
     Price stepped = 100'00;
     for (int i = 0; i < 10; ++i) stepped += 1;  // ten ticks up
-    assert(stepped == 100'10);                  // exact: no drift to accumulate
+    CHECK(stepped == 100'10);                  // exact: no drift to accumulate
 
     OrderBook book;
     book.addLimitOrder(1, Side::Sell, stepped, 5);
     auto result = book.addLimitOrder(2, Side::Buy, 100'10, 5);
 
-    assert(result.trades.size() == 1);
-    assert(result.trades[0].price == 100'10);
-    assert(book.restingOrderCount() == 0);  // no locked book left behind
+    CHECK(result.trades.size() == 1);
+    CHECK(result.trades[0].price == 100'10);
+    CHECK(book.restingOrderCount() == 0);  // no locked book left behind
     std::cout << "test_arithmetic_price_crosses_literal_price passed\n";
 }
 
@@ -206,10 +224,10 @@ void test_same_price_is_a_single_level() {
     book.addLimitOrder(2, Side::Sell, stepped, 5);  // same level, not a new one
     auto result = book.addLimitOrder(3, Side::Buy, 100'10, 10);
 
-    assert(result.trades.size() == 2);              // both consumed by one sweep
-    assert(result.trades[0].sell_order_id == 1);    // FIFO within the level
-    assert(result.trades[1].sell_order_id == 2);
-    assert(book.restingOrderCount() == 0);
+    CHECK(result.trades.size() == 2);              // both consumed by one sweep
+    CHECK(result.trades[0].sell_order_id == 1);    // FIFO within the level
+    CHECK(result.trades[1].sell_order_id == 2);
+    CHECK(book.restingOrderCount() == 0);
     std::cout << "test_same_price_is_a_single_level passed\n";
 }
 
@@ -218,10 +236,10 @@ void test_sub_unit_prices_are_exact() {
     book.addLimitOrder(1, Side::Sell, 100'50, 10);
     auto result = book.addLimitOrder(2, Side::Buy, 100'50, 4);
 
-    assert(result.trades.size() == 1);
-    assert(result.trades[0].price == 100'50);
-    assert(result.trades[0].quantity == 4);
-    assert(book.bestAsk().has_value() && *book.bestAsk() == 100'50);
+    CHECK(result.trades.size() == 1);
+    CHECK(result.trades[0].price == 100'50);
+    CHECK(result.trades[0].quantity == 4);
+    CHECK(book.bestAsk().has_value() && *book.bestAsk() == 100'50);
     std::cout << "test_sub_unit_prices_are_exact passed\n";
 }
 
@@ -232,9 +250,9 @@ void test_unfilled_reports_rested_amount_for_limit_order() {
     book.addLimitOrder(1, Side::Sell, 100'00, 4);
     auto result = book.addLimitOrder(2, Side::Buy, 100'00, 10);
 
-    assert(result.accepted());
-    assert(result.unfilled == 6);  // 4 filled, 6 now resting
-    assert(book.restingOrderCount() == 1);
+    CHECK(result.accepted());
+    CHECK(result.unfilled == 6);  // 4 filled, 6 now resting
+    CHECK(book.restingOrderCount() == 1);
     std::cout << "test_unfilled_reports_rested_amount_for_limit_order passed\n";
 }
 
@@ -243,9 +261,9 @@ void test_unfilled_reports_discarded_amount_for_market_order() {
     book.addLimitOrder(1, Side::Sell, 100'00, 4);
     auto result = book.addMarketOrder(2, Side::Buy, 10);
 
-    assert(result.accepted());
-    assert(result.unfilled == 6);           // 4 filled, 6 discarded...
-    assert(book.restingOrderCount() == 0);  // ...not rested
+    CHECK(result.accepted());
+    CHECK(result.unfilled == 6);           // 4 filled, 6 discarded...
+    CHECK(book.restingOrderCount() == 0);  // ...not rested
     std::cout << "test_unfilled_reports_discarded_amount_for_market_order passed\n";
 }
 
@@ -254,8 +272,8 @@ void test_unfilled_is_full_quantity_on_rejection() {
     book.addLimitOrder(1, Side::Buy, 100'00, 5);
     auto dup = book.addLimitOrder(1, Side::Buy, 101'00, 7);
 
-    assert(!dup.accepted());
-    assert(dup.unfilled == 7);  // nothing filled, nothing rested
+    CHECK(!dup.accepted());
+    CHECK(dup.unfilled == 7);  // nothing filled, nothing rested
     std::cout << "test_unfilled_is_full_quantity_on_rejection passed\n";
 }
 
@@ -266,12 +284,12 @@ void test_modify_shrink_keeps_time_priority() {
     book.addLimitOrder(1, Side::Sell, 100'00, 10);  // arrived first
     book.addLimitOrder(2, Side::Sell, 100'00, 10);  // arrived second
 
-    assert(book.modifyOrder(1, 100'00, 4).accepted());  // shrink, same price
+    CHECK(book.modifyOrder(1, 100'00, 4).accepted());  // shrink, same price
 
     // Order 1 must still be at the front of the level.
     auto trades = book.addLimitOrder(3, Side::Buy, 100'00, 4).trades;
-    assert(trades.size() == 1);
-    assert(trades[0].sell_order_id == 1);
+    CHECK(trades.size() == 1);
+    CHECK(trades[0].sell_order_id == 1);
     std::cout << "test_modify_shrink_keeps_time_priority passed\n";
 }
 
@@ -280,12 +298,12 @@ void test_modify_grow_surrenders_time_priority() {
     book.addLimitOrder(1, Side::Sell, 100'00, 10);  // arrived first
     book.addLimitOrder(2, Side::Sell, 100'00, 10);  // arrived second
 
-    assert(book.modifyOrder(1, 100'00, 12).accepted());  // grow, same price
+    CHECK(book.modifyOrder(1, 100'00, 12).accepted());  // grow, same price
 
     // Order 1 went to the back, so order 2 is now first in line.
     auto trades = book.addLimitOrder(3, Side::Buy, 100'00, 4).trades;
-    assert(trades.size() == 1);
-    assert(trades[0].sell_order_id == 2);
+    CHECK(trades.size() == 1);
+    CHECK(trades[0].sell_order_id == 2);
     std::cout << "test_modify_grow_surrenders_time_priority passed\n";
 }
 
@@ -297,14 +315,14 @@ void test_modify_reprice_surrenders_time_priority() {
 
     // Move order 1 down to the 101 level; it should land behind 2 and 3 even
     // though it arrived before both.
-    assert(book.modifyOrder(1, 101'00, 10).accepted());
-    assert(!book.bestAsk().has_value() || *book.bestAsk() == 101'00);
+    CHECK(book.modifyOrder(1, 101'00, 10).accepted());
+    CHECK(!book.bestAsk().has_value() || *book.bestAsk() == 101'00);
 
     auto trades = book.addLimitOrder(4, Side::Buy, 101'00, 25).trades;
-    assert(trades.size() == 3);
-    assert(trades[0].sell_order_id == 2);
-    assert(trades[1].sell_order_id == 3);
-    assert(trades[2].sell_order_id == 1);  // repriced order is last
+    CHECK(trades.size() == 3);
+    CHECK(trades[0].sell_order_id == 2);
+    CHECK(trades[1].sell_order_id == 3);
+    CHECK(trades[2].sell_order_id == 1);  // repriced order is last
     std::cout << "test_modify_reprice_surrenders_time_priority passed\n";
 }
 
@@ -316,12 +334,12 @@ void test_modify_into_a_crossing_price_trades() {
     // Reprice the ask down through the bid: it should trade on the way in,
     // at the resting bid's price, and rest the remainder.
     auto result = book.modifyOrder(1, 99'00, 10);
-    assert(result.accepted());
-    assert(result.trades.size() == 1);
-    assert(result.trades[0].price == 100'00);  // resting order sets the price
-    assert(result.trades[0].quantity == 4);
-    assert(result.unfilled == 6);
-    assert(book.bestAsk().has_value() && *book.bestAsk() == 99'00);
+    CHECK(result.accepted());
+    CHECK(result.trades.size() == 1);
+    CHECK(result.trades[0].price == 100'00);  // resting order sets the price
+    CHECK(result.trades[0].quantity == 4);
+    CHECK(result.unfilled == 6);
+    CHECK(book.bestAsk().has_value() && *book.bestAsk() == 99'00);
     std::cout << "test_modify_into_a_crossing_price_trades passed\n";
 }
 
@@ -329,13 +347,13 @@ void test_modify_rejects_unknown_and_zero_quantity() {
     OrderBook book;
     book.addLimitOrder(1, Side::Buy, 100'00, 5);
 
-    assert(!book.modifyOrder(99, 100'00, 5).accepted());  // never existed
-    assert(!book.modifyOrder(1, 100'00, 0).accepted());   // zero is not a cancel
+    CHECK(!book.modifyOrder(99, 100'00, 5).accepted());  // never existed
+    CHECK(!book.modifyOrder(1, 100'00, 0).accepted());   // zero is not a cancel
 
     // Neither rejection may have disturbed the book.
-    assert(book.restingOrderCount() == 1);
-    assert(book.bestBid().has_value() && *book.bestBid() == 100'00);
-    assert(book.cancelOrder(1));
+    CHECK(book.restingOrderCount() == 1);
+    CHECK(book.bestBid().has_value() && *book.bestBid() == 100'00);
+    CHECK(book.cancelOrder(1));
     std::cout << "test_modify_rejects_unknown_and_zero_quantity passed\n";
 }
 
@@ -345,13 +363,13 @@ void test_modify_rejects_unknown_and_zero_quantity() {
 void test_modify_leaves_order_cancellable_and_accounted() {
     OrderBook book;
     book.addLimitOrder(1, Side::Buy, 100'00, 5);
-    assert(book.modifyOrder(1, 98'00, 7).accepted());
-    assert(book.restingOrderCount() == 1);  // one order, not two
-    assert(book.bestBid().has_value() && *book.bestBid() == 98'00);
+    CHECK(book.modifyOrder(1, 98'00, 7).accepted());
+    CHECK(book.restingOrderCount() == 1);  // one order, not two
+    CHECK(book.bestBid().has_value() && *book.bestBid() == 98'00);
 
-    assert(book.cancelOrder(1));            // still reachable by id
-    assert(book.restingOrderCount() == 0);
-    assert(!book.bestBid().has_value());    // no orphan left at 100'00
+    CHECK(book.cancelOrder(1));            // still reachable by id
+    CHECK(book.restingOrderCount() == 0);
+    CHECK(!book.bestBid().has_value());    // no orphan left at 100'00
     std::cout << "test_modify_leaves_order_cancellable_and_accounted passed\n";
 }
 
@@ -359,10 +377,10 @@ void test_modify_a_fully_filled_order_is_rejected() {
     OrderBook book;
     book.addLimitOrder(1, Side::Sell, 100'00, 5);
     book.addLimitOrder(2, Side::Buy, 100'00, 5);  // consumes order 1 entirely
-    assert(book.restingOrderCount() == 0);
+    CHECK(book.restingOrderCount() == 0);
 
-    assert(!book.modifyOrder(1, 101'00, 5).accepted());  // nothing left to modify
-    assert(book.restingOrderCount() == 0);
+    CHECK(!book.modifyOrder(1, 101'00, 5).accepted());  // nothing left to modify
+    CHECK(book.restingOrderCount() == 0);
     std::cout << "test_modify_a_fully_filled_order_is_rejected passed\n";
 }
 
@@ -376,15 +394,15 @@ void test_self_trade_cancel_oldest_removes_resting_order() {
     book.addLimitOrder(1, Side::Sell, 100'00, 5, kAlice);
     auto result = book.addLimitOrder(2, Side::Buy, 100'00, 5, kAlice);
 
-    assert(result.accepted());
-    assert(result.trades.empty());              // no wash trade
-    assert(!result.cancelled_by_self_trade);    // the aggressor survived
-    assert(result.unfilled == 5);
+    CHECK(result.accepted());
+    CHECK(result.trades.empty());              // no wash trade
+    CHECK(!result.cancelled_by_self_trade);    // the aggressor survived
+    CHECK(result.unfilled == 5);
 
     // Alice's resting sell is gone and her buy took its place in the book.
-    assert(!book.bestAsk().has_value());
-    assert(book.bestBid().has_value() && *book.bestBid() == 100'00);
-    assert(book.restingOrderCount() == 1);
+    CHECK(!book.bestAsk().has_value());
+    CHECK(book.bestBid().has_value() && *book.bestBid() == 100'00);
+    CHECK(book.restingOrderCount() == 1);
     std::cout << "test_self_trade_cancel_oldest_removes_resting_order passed\n";
 }
 
@@ -396,10 +414,10 @@ void test_self_trade_cancel_oldest_continues_into_next_order() {
     auto result = book.addLimitOrder(3, Side::Buy, 100'00, 5, kAlice);
 
     // Alice's own order steps aside, and she trades with Bob's behind it.
-    assert(result.trades.size() == 1);
-    assert(result.trades[0].sell_order_id == 2);
-    assert(result.unfilled == 0);
-    assert(book.restingOrderCount() == 0);
+    CHECK(result.trades.size() == 1);
+    CHECK(result.trades[0].sell_order_id == 2);
+    CHECK(result.unfilled == 0);
+    CHECK(book.restingOrderCount() == 0);
     std::cout << "test_self_trade_cancel_oldest_continues_into_next_order passed\n";
 }
 
@@ -408,16 +426,16 @@ void test_self_trade_cancel_newest_cancels_incoming_without_resting_it() {
     book.addLimitOrder(1, Side::Sell, 100'00, 5, kAlice);
     auto result = book.addLimitOrder(2, Side::Buy, 100'00, 5, kAlice);
 
-    assert(result.accepted());
-    assert(result.trades.empty());
-    assert(result.cancelled_by_self_trade);
-    assert(result.unfilled == 5);  // the cancelled quantity, not a resting one
+    CHECK(result.accepted());
+    CHECK(result.trades.empty());
+    CHECK(result.cancelled_by_self_trade);
+    CHECK(result.unfilled == 5);  // the cancelled quantity, not a resting one
 
     // The incoming order must NOT be in the book -- resting it would leave
     // Alice crossed against herself.
-    assert(book.restingOrderCount() == 1);
-    assert(!book.bestBid().has_value());
-    assert(book.bestAsk().has_value() && *book.bestAsk() == 100'00);
+    CHECK(book.restingOrderCount() == 1);
+    CHECK(!book.bestBid().has_value());
+    CHECK(book.bestAsk().has_value() && *book.bestAsk() == 100'00);
     std::cout << "test_self_trade_cancel_newest_cancels_incoming_without_resting_it passed\n";
 }
 
@@ -428,11 +446,11 @@ void test_cancel_newest_keeps_fills_made_before_the_self_match() {
 
     auto result = book.addLimitOrder(3, Side::Buy, 100'00, 10, kAlice);
 
-    assert(result.trades.size() == 1);           // Bob's 3 filled first
-    assert(result.trades[0].quantity == 3);
-    assert(result.cancelled_by_self_trade);      // then it hit her own order
-    assert(result.unfilled == 7);                // 10 - 3, cancelled not rested
-    assert(book.restingOrderCount() == 1);       // only Alice's original sell
+    CHECK(result.trades.size() == 1);           // Bob's 3 filled first
+    CHECK(result.trades[0].quantity == 3);
+    CHECK(result.cancelled_by_self_trade);      // then it hit her own order
+    CHECK(result.unfilled == 7);                // 10 - 3, cancelled not rested
+    CHECK(book.restingOrderCount() == 1);       // only Alice's original sell
     std::cout << "test_cancel_newest_keeps_fills_made_before_the_self_match passed\n";
 }
 
@@ -441,9 +459,9 @@ void test_different_participants_trade_normally() {
     book.addLimitOrder(1, Side::Sell, 100'00, 5, kAlice);
     auto result = book.addLimitOrder(2, Side::Buy, 100'00, 5, kBob);
 
-    assert(result.trades.size() == 1);
-    assert(result.trades[0].quantity == 5);
-    assert(book.restingOrderCount() == 0);
+    CHECK(result.trades.size() == 1);
+    CHECK(result.trades[0].quantity == 5);
+    CHECK(book.restingOrderCount() == 0);
     std::cout << "test_different_participants_trade_normally passed\n";
 }
 
@@ -454,9 +472,9 @@ void test_anonymous_orders_are_exempt_from_self_trade_prevention() {
     book.addLimitOrder(1, Side::Sell, 100'00, 5, kNoParticipant);
     auto result = book.addLimitOrder(2, Side::Buy, 100'00, 5, kNoParticipant);
 
-    assert(result.trades.size() == 1);      // they trade
-    assert(!result.cancelled_by_self_trade);
-    assert(book.restingOrderCount() == 0);
+    CHECK(result.trades.size() == 1);      // they trade
+    CHECK(!result.cancelled_by_self_trade);
+    CHECK(book.restingOrderCount() == 0);
     std::cout << "test_anonymous_orders_are_exempt_from_self_trade_prevention passed\n";
 }
 
@@ -469,23 +487,23 @@ void test_self_trade_prevention_applies_to_market_orders() {
 
     // Alice's own order is cancelled out of the way, and the sweep continues
     // to the next level rather than stopping.
-    assert(result.trades.size() == 1);
-    assert(result.trades[0].sell_order_id == 2);
-    assert(result.trades[0].price == 101'00);
-    assert(book.restingOrderCount() == 0);
+    CHECK(result.trades.size() == 1);
+    CHECK(result.trades[0].sell_order_id == 2);
+    CHECK(result.trades[0].price == 101'00);
+    CHECK(book.restingOrderCount() == 0);
     std::cout << "test_self_trade_prevention_applies_to_market_orders passed\n";
 }
 
 void test_modify_inherits_the_participant() {
     OrderBook book;
     book.addLimitOrder(1, Side::Buy, 100'00, 5, kAlice);
-    assert(book.modifyOrder(1, 99'00, 8).accepted());  // repriced, so resubmitted
+    CHECK(book.modifyOrder(1, 99'00, 8).accepted());  // repriced, so resubmitted
 
     // If the modify had dropped Alice's id, this would trade instead of
     // being prevented.
     auto result = book.addLimitOrder(2, Side::Sell, 99'00, 3, kAlice);
-    assert(result.trades.empty());
-    assert(book.bestBid() == std::nullopt);  // her repriced buy was cancelled
+    CHECK(result.trades.empty());
+    CHECK(book.bestBid() == std::nullopt);  // her repriced buy was cancelled
     std::cout << "test_modify_inherits_the_participant passed\n";
 }
 
@@ -496,24 +514,24 @@ void test_engine_rejects_orders_for_unregistered_symbols() {
     engine.addSymbol("AAPL");
 
     auto result = engine.addLimitOrder("MSFT", 1, Side::Buy, 100'00, 5);
-    assert(!result.accepted());
-    assert(result.reason == RejectReason::UnknownSymbol);
-    assert(result.unfilled == 5);
+    CHECK(!result.accepted());
+    CHECK(result.reason == RejectReason::UnknownSymbol);
+    CHECK(result.unfilled == 5);
 
     // A typo must not quietly open a new instrument.
-    assert(engine.symbolCount() == 1);
-    assert(!engine.hasSymbol("MSFT"));
-    assert(engine.restingOrderCount() == 0);
+    CHECK(engine.symbolCount() == 1);
+    CHECK(!engine.hasSymbol("MSFT"));
+    CHECK(engine.restingOrderCount() == 0);
     std::cout << "test_engine_rejects_orders_for_unregistered_symbols passed\n";
 }
 
 void test_engine_add_symbol_is_idempotent() {
     MatchingEngine engine;
-    assert(engine.addSymbol("AAPL"));
+    CHECK(engine.addSymbol("AAPL"));
     engine.addLimitOrder("AAPL", 1, Side::Buy, 100'00, 5);
 
-    assert(!engine.addSymbol("AAPL"));            // already registered
-    assert(engine.restingOrderCount("AAPL") == 1);  // and its book survived
+    CHECK(!engine.addSymbol("AAPL"));            // already registered
+    CHECK(engine.restingOrderCount("AAPL") == 1);  // and its book survived
     std::cout << "test_engine_add_symbol_is_idempotent passed\n";
 }
 
@@ -528,12 +546,12 @@ void test_engine_books_do_not_interact() {
 
     // Reusing id 1 on another symbol is fine -- ids are scoped per book -- and
     // the crossing prices must not match across instruments.
-    assert(result.accepted());
-    assert(result.trades.empty());
-    assert(engine.bestAsk("AAPL") == 100'00);
-    assert(engine.bestBid("MSFT") == 100'00);
-    assert(!engine.bestBid("AAPL").has_value());
-    assert(!engine.bestAsk("MSFT").has_value());
+    CHECK(result.accepted());
+    CHECK(result.trades.empty());
+    CHECK(engine.bestAsk("AAPL") == 100'00);
+    CHECK(engine.bestBid("MSFT") == 100'00);
+    CHECK(!engine.bestBid("AAPL").has_value());
+    CHECK(!engine.bestAsk("MSFT").has_value());
     std::cout << "test_engine_books_do_not_interact passed\n";
 }
 
@@ -543,16 +561,16 @@ void test_engine_routes_cancel_and_modify_by_symbol() {
     engine.addSymbol("MSFT");
     engine.addLimitOrder("AAPL", 1, Side::Buy, 100'00, 5);
 
-    assert(!engine.cancelOrder("MSFT", 1));   // right id, wrong book
-    assert(!engine.cancelOrder("NVDA", 1));   // unknown symbol
-    assert(engine.restingOrderCount() == 1);  // neither touched anything
+    CHECK(!engine.cancelOrder("MSFT", 1));   // right id, wrong book
+    CHECK(!engine.cancelOrder("NVDA", 1));   // unknown symbol
+    CHECK(engine.restingOrderCount() == 1);  // neither touched anything
 
-    assert(!engine.modifyOrder("MSFT", 1, 99'00, 5).accepted());
-    assert(engine.modifyOrder("AAPL", 1, 99'00, 5).accepted());
-    assert(engine.bestBid("AAPL") == 99'00);
+    CHECK(!engine.modifyOrder("MSFT", 1, 99'00, 5).accepted());
+    CHECK(engine.modifyOrder("AAPL", 1, 99'00, 5).accepted());
+    CHECK(engine.bestBid("AAPL") == 99'00);
 
-    assert(engine.cancelOrder("AAPL", 1));
-    assert(engine.restingOrderCount() == 0);
+    CHECK(engine.cancelOrder("AAPL", 1));
+    CHECK(engine.restingOrderCount() == 0);
     std::cout << "test_engine_routes_cancel_and_modify_by_symbol passed\n";
 }
 
@@ -564,10 +582,10 @@ void test_engine_resting_count_aggregates_across_books() {
     engine.addLimitOrder("AAPL", 2, Side::Buy, 99'00, 5);
     engine.addLimitOrder("MSFT", 1, Side::Sell, 200'00, 5);
 
-    assert(engine.restingOrderCount("AAPL") == 2);
-    assert(engine.restingOrderCount("MSFT") == 1);
-    assert(engine.restingOrderCount("NVDA") == 0);  // unknown symbol, not an error
-    assert(engine.restingOrderCount() == 3);
+    CHECK(engine.restingOrderCount("AAPL") == 2);
+    CHECK(engine.restingOrderCount("MSFT") == 1);
+    CHECK(engine.restingOrderCount("NVDA") == 0);  // unknown symbol, not an error
+    CHECK(engine.restingOrderCount() == 3);
     std::cout << "test_engine_resting_count_aggregates_across_books passed\n";
 }
 
@@ -578,8 +596,8 @@ void test_engine_propagates_self_trade_policy_to_new_books() {
     engine.addLimitOrder("AAPL", 1, Side::Sell, 100'00, 5, kAlice);
     auto result = engine.addLimitOrder("AAPL", 2, Side::Buy, 100'00, 5, kAlice);
 
-    assert(result.cancelled_by_self_trade);  // the book got the engine's policy
-    assert(engine.restingOrderCount("AAPL") == 1);
+    CHECK(result.cancelled_by_self_trade);  // the book got the engine's policy
+    CHECK(engine.restingOrderCount("AAPL") == 1);
     std::cout << "test_engine_propagates_self_trade_policy_to_new_books passed\n";
 }
 
@@ -606,17 +624,17 @@ void test_replay_reproduces_engine_state() {
     std::istringstream in(log_stream.str());
     auto result = replay(in, restored);
 
-    assert(!result.truncated);
-    assert(result.applied == log.nextSequence());
-    assert(live.restingOrderCount() > 0);  // the comparison isn't vacuous
+    CHECK(!result.truncated);
+    CHECK(result.applied == log.nextSequence());
+    CHECK(live.restingOrderCount() > 0);  // the comparison isn't vacuous
 
-    assert(restored.symbolCount() == live.symbolCount());
-    assert(restored.restingOrderCount() == live.restingOrderCount());
-    assert(restored.restingOrderCount("AAPL") == live.restingOrderCount("AAPL"));
-    assert(restored.bestBid("AAPL") == live.bestBid("AAPL"));
-    assert(restored.bestAsk("AAPL") == live.bestAsk("AAPL"));
-    assert(restored.bestBid("MSFT") == live.bestBid("MSFT"));
-    assert(restored.bestAsk("MSFT") == live.bestAsk("MSFT"));
+    CHECK(restored.symbolCount() == live.symbolCount());
+    CHECK(restored.restingOrderCount() == live.restingOrderCount());
+    CHECK(restored.restingOrderCount("AAPL") == live.restingOrderCount("AAPL"));
+    CHECK(restored.bestBid("AAPL") == live.bestBid("AAPL"));
+    CHECK(restored.bestAsk("AAPL") == live.bestAsk("AAPL"));
+    CHECK(restored.bestBid("MSFT") == live.bestBid("MSFT"));
+    CHECK(restored.bestAsk("MSFT") == live.bestAsk("MSFT"));
     std::cout << "test_replay_reproduces_engine_state passed\n";
 }
 
@@ -630,20 +648,20 @@ void test_log_records_rejected_requests_and_replays_them_as_no_ops() {
 
     live.addSymbol("AAPL");
     live.addLimitOrder("AAPL", 1, Side::Buy, 100'00, 5);
-    assert(!live.addLimitOrder("AAPL", 1, Side::Buy, 99'00, 5).accepted());   // duplicate id
-    assert(!live.addLimitOrder("NVDA", 2, Side::Buy, 10'00, 5).accepted());   // unknown symbol
+    CHECK(!live.addLimitOrder("AAPL", 1, Side::Buy, 99'00, 5).accepted());   // duplicate id
+    CHECK(!live.addLimitOrder("NVDA", 2, Side::Buy, 10'00, 5).accepted());   // unknown symbol
 
-    assert(log.nextSequence() == 4);  // all four requests, not just the two that took
+    CHECK(log.nextSequence() == 4);  // all four requests, not just the two that took
 
     MatchingEngine restored;
     std::istringstream in(log_stream.str());
     auto result = replay(in, restored);
 
-    assert(result.applied == 4);
-    assert(!result.truncated);
-    assert(restored.restingOrderCount() == 1);
-    assert(restored.bestBid("AAPL") == 100'00);
-    assert(!restored.hasSymbol("NVDA"));
+    CHECK(result.applied == 4);
+    CHECK(!result.truncated);
+    CHECK(restored.restingOrderCount() == 1);
+    CHECK(restored.bestBid("AAPL") == 100'00);
+    CHECK(!restored.hasSymbol("NVDA"));
     std::cout << "test_log_records_rejected_requests_and_replays_them_as_no_ops passed\n";
 }
 
@@ -666,12 +684,12 @@ void test_replay_does_not_append_to_an_attached_log() {
     std::istringstream in(captured);
     replay(in, restarted);
 
-    assert(log.nextSequence() == records_before);  // nothing appended
-    assert(log_stream.str() == captured);
-    assert(restarted.eventLog() == &log);         // and logging is restored
+    CHECK(log.nextSequence() == records_before);  // nothing appended
+    CHECK(log_stream.str() == captured);
+    CHECK(restarted.eventLog() == &log);         // and logging is restored
 
     restarted.addLimitOrder("AAPL", 2, Side::Buy, 99'00, 5);
-    assert(log.nextSequence() == records_before + 1);  // still live afterwards
+    CHECK(log.nextSequence() == records_before + 1);  // still live afterwards
     std::cout << "test_replay_does_not_append_to_an_attached_log passed\n";
 }
 
@@ -693,11 +711,11 @@ void test_replay_stops_at_a_torn_final_record() {
     std::istringstream in(text);
     auto result = replay(in, restored);
 
-    assert(result.truncated);
-    assert(result.applied == 2);           // the two intact records still count
-    assert(result.stopped_at_line == 3);
-    assert(restored.restingOrderCount() == 1);
-    assert(restored.bestBid("AAPL") == 100'00);
+    CHECK(result.truncated);
+    CHECK(result.applied == 2);           // the two intact records still count
+    CHECK(result.stopped_at_line == 3);
+    CHECK(restored.restingOrderCount() == 1);
+    CHECK(restored.bestBid("AAPL") == 100'00);
     std::cout << "test_replay_stops_at_a_torn_final_record passed\n";
 }
 
@@ -706,20 +724,20 @@ void test_replay_stops_on_a_sequence_gap() {
     std::istringstream in("0 SYMBOL AAPL\n2 LIMIT AAPL 1 BUY 10000 5 0\n");  // seq 1 missing
     auto result = replay(in, restored);
 
-    assert(result.truncated);
-    assert(result.applied == 1);
-    assert(result.stopped_at_line == 2);
-    assert(restored.restingOrderCount() == 0);
+    CHECK(result.truncated);
+    CHECK(result.applied == 1);
+    CHECK(result.stopped_at_line == 2);
+    CHECK(restored.restingOrderCount() == 0);
     std::cout << "test_replay_stops_on_a_sequence_gap passed\n";
 }
 
 void test_symbols_must_be_a_single_token() {
     MatchingEngine engine;
-    assert(!engine.addSymbol(""));       // would produce an unparseable record
-    assert(!engine.addSymbol("A B"));
-    assert(!engine.addSymbol("A\tB"));
-    assert(engine.addSymbol("AAPL"));
-    assert(engine.symbolCount() == 1);
+    CHECK(!engine.addSymbol(""));       // would produce an unparseable record
+    CHECK(!engine.addSymbol("A B"));
+    CHECK(!engine.addSymbol("A\tB"));
+    CHECK(engine.addSymbol("AAPL"));
+    CHECK(engine.symbolCount() == 1);
     std::cout << "test_symbols_must_be_a_single_token passed\n";
 }
 
@@ -737,8 +755,8 @@ void test_replay_preserves_participants() {
 
     // Had the participant not survived the round trip, this would trade.
     auto result = restored.addLimitOrder("AAPL", 2, Side::Buy, 100'00, 5, kAlice);
-    assert(result.trades.empty());
-    assert(restored.restingOrderCount() == 1);
+    CHECK(result.trades.empty());
+    CHECK(restored.restingOrderCount() == 1);
     std::cout << "test_replay_preserves_participants passed\n";
 }
 
@@ -764,27 +782,27 @@ void buildRepresentativeState(MatchingEngine& engine) {
 }
 
 void assertSameObservableState(const MatchingEngine& a, const MatchingEngine& b) {
-    assert(a.symbolCount() == b.symbolCount());
-    assert(a.symbols() == b.symbols());
-    assert(a.restingOrderCount() == b.restingOrderCount());
+    CHECK(a.symbolCount() == b.symbolCount());
+    CHECK(a.symbols() == b.symbols());
+    CHECK(a.restingOrderCount() == b.restingOrderCount());
     for (const Symbol& symbol : a.symbols()) {
-        assert(a.restingOrderCount(symbol) == b.restingOrderCount(symbol));
-        assert(a.bestBid(symbol) == b.bestBid(symbol));
-        assert(a.bestAsk(symbol) == b.bestAsk(symbol));
+        CHECK(a.restingOrderCount(symbol) == b.restingOrderCount(symbol));
+        CHECK(a.bestBid(symbol) == b.bestBid(symbol));
+        CHECK(a.bestAsk(symbol) == b.bestAsk(symbol));
         const OrderBook* book_a = a.book(symbol);
         const OrderBook* book_b = b.book(symbol);
-        assert(book_a != nullptr && book_b != nullptr);
+        CHECK(book_a != nullptr && book_b != nullptr);
         const std::vector<Order> orders_a = book_a->restingOrders();
         const std::vector<Order> orders_b = book_b->restingOrders();
-        assert(orders_a.size() == orders_b.size());
+        CHECK(orders_a.size() == orders_b.size());
         // Compared in book order, so this checks queue position too, not just
         // which orders survived.
         for (std::size_t i = 0; i < orders_a.size(); ++i) {
-            assert(orders_a[i].id == orders_b[i].id);
-            assert(orders_a[i].participant == orders_b[i].participant);
-            assert(orders_a[i].side == orders_b[i].side);
-            assert(orders_a[i].price == orders_b[i].price);
-            assert(orders_a[i].quantity == orders_b[i].quantity);
+            CHECK(orders_a[i].id == orders_b[i].id);
+            CHECK(orders_a[i].participant == orders_b[i].participant);
+            CHECK(orders_a[i].side == orders_b[i].side);
+            CHECK(orders_a[i].price == orders_b[i].price);
+            CHECK(orders_a[i].quantity == orders_b[i].quantity);
         }
     }
 }
@@ -794,7 +812,7 @@ void assertSameObservableState(const MatchingEngine& a, const MatchingEngine& b)
 void test_snapshot_round_trip_preserves_state_and_queue_order() {
     MatchingEngine live;
     buildRepresentativeState(live);
-    assert(live.restingOrderCount() > 3);  // not a vacuous comparison
+    CHECK(live.restingOrderCount() > 3);  // not a vacuous comparison
 
     std::ostringstream snap;
     writeSnapshot(snap, live, 42);
@@ -803,13 +821,13 @@ void test_snapshot_round_trip_preserves_state_and_queue_order() {
     std::istringstream in(snap.str());
     auto result = loadSnapshot(in, restored);
 
-    assert(result.ok);
-    assert(result.next_seq == 42);
-    assert(result.orders_loaded == live.restingOrderCount());
+    CHECK(result.ok);
+    CHECK(result.next_seq == 42);
+    CHECK(result.orders_loaded == live.restingOrderCount());
     assertSameObservableState(live, restored);
 
     // An instrument with no orders is still an instrument.
-    assert(restored.hasSymbol("EMPTY"));
+    CHECK(restored.hasSymbol("EMPTY"));
     std::cout << "test_snapshot_round_trip_preserves_state_and_queue_order passed\n";
 }
 
@@ -825,7 +843,7 @@ void test_snapshot_is_deterministic_for_identical_state() {
     writeSnapshot(snap_b, b, 7);
 
     // Byte-identical, which is what sorting the symbols buys.
-    assert(snap_a.str() == snap_b.str());
+    CHECK(snap_a.str() == snap_b.str());
     std::cout << "test_snapshot_is_deterministic_for_identical_state passed\n";
 }
 
@@ -843,7 +861,7 @@ void test_truncated_snapshot_is_rejected() {
     std::istringstream in(text);
     auto result = loadSnapshot(in, restored);
 
-    assert(!result.ok);  // missing END, so the caller must discard `restored`
+    CHECK(!result.ok);  // missing END, so the caller must discard `restored`
     std::cout << "test_truncated_snapshot_is_rejected passed\n";
 }
 
@@ -851,7 +869,7 @@ void test_snapshot_of_unknown_version_is_rejected() {
     MatchingEngine restored;
     std::istringstream in("SNAPSHOT 99 5\nSYMBOL AAPL\nEND\n");
     auto result = loadSnapshot(in, restored);
-    assert(!result.ok);
+    CHECK(!result.ok);
     std::cout << "test_snapshot_of_unknown_version_is_rejected passed\n";
 }
 
@@ -879,12 +897,12 @@ void test_compaction_recovers_snapshot_plus_log_tail() {
     MatchingEngine restored;
     std::istringstream snap_in(snap.str());
     auto snap_result = loadSnapshot(snap_in, restored);
-    assert(snap_result.ok);
+    CHECK(snap_result.ok);
 
     std::istringstream tail_in(tail_stream.str());
     auto replay_result = replay(tail_in, restored, snap_result.next_seq);
-    assert(!replay_result.truncated);
-    assert(replay_result.applied == 3);
+    CHECK(!replay_result.truncated);
+    CHECK(replay_result.applied == 3);
 
     assertSameObservableState(live, restored);
     std::cout << "test_compaction_recovers_snapshot_plus_log_tail passed\n";
@@ -911,13 +929,13 @@ void test_recovery_survives_a_crash_between_snapshot_and_truncation() {
     MatchingEngine restored;
     std::istringstream snap_in(snap.str());
     auto snap_result = loadSnapshot(snap_in, restored);
-    assert(snap_result.ok);
+    CHECK(snap_result.ok);
 
     std::istringstream log_in(log_stream.str());  // full log, from sequence 0
     auto replay_result = replay(log_in, restored, snap_result.next_seq);
 
-    assert(!replay_result.truncated);   // the old prefix is skipped, not an error
-    assert(replay_result.applied == 2);  // only the two records after the snapshot
+    CHECK(!replay_result.truncated);   // the old prefix is skipped, not an error
+    CHECK(replay_result.applied == 2);  // only the two records after the snapshot
     assertSameObservableState(live, restored);
     std::cout << "test_recovery_survives_a_crash_between_snapshot_and_truncation passed\n";
 }
@@ -930,7 +948,7 @@ std::vector<std::uint8_t> encodeAll(const std::vector<Request>& requests) {
     std::vector<std::uint8_t> bytes;
     for (const Request& request : requests) {
         const bool ok = encodeRequest(request, bytes);
-        assert(ok);
+        CHECK(ok);
     }
     return bytes;
 }
@@ -961,16 +979,16 @@ std::vector<Request> readSplitAt(const std::vector<std::uint8_t>& bytes, std::si
     reader.append(bytes.data(), split);
     while (reader.next(type, correlation, payload)) {
         Request request;
-        assert(decodeRequest(type, correlation, payload.data(), payload.size(), request));
+        CHECK(decodeRequest(type, correlation, payload.data(), payload.size(), request));
         decoded.push_back(request);
     }
     reader.append(bytes.data() + split, bytes.size() - split);
     while (reader.next(type, correlation, payload)) {
         Request request;
-        assert(decodeRequest(type, correlation, payload.data(), payload.size(), request));
+        CHECK(decodeRequest(type, correlation, payload.data(), payload.size(), request));
         decoded.push_back(request);
     }
-    assert(!reader.failed());
+    CHECK(!reader.failed());
     return decoded;
 }
 
@@ -1011,15 +1029,15 @@ void test_wire_round_trips_every_request_type() {
                                        modify, cancel, limitRequest(6, 1, Side::Buy, -12'34, 1, 0)};
     const std::vector<Request> got = readSplitAt(encodeAll(sent), 0);
 
-    assert(got.size() == sent.size());
+    CHECK(got.size() == sent.size());
     for (std::size_t i = 0; i < sent.size(); ++i) {
-        assert(got[i].type == sent[i].type);
-        assert(got[i].correlation_id == sent[i].correlation_id);
-        assert(got[i].symbol == sent[i].symbol);
-        assert(got[i].order_id == sent[i].order_id);
-        assert(got[i].price == sent[i].price);
-        assert(got[i].quantity == sent[i].quantity);
-        assert(got[i].participant == sent[i].participant);
+        CHECK(got[i].type == sent[i].type);
+        CHECK(got[i].correlation_id == sent[i].correlation_id);
+        CHECK(got[i].symbol == sent[i].symbol);
+        CHECK(got[i].order_id == sent[i].order_id);
+        CHECK(got[i].price == sent[i].price);
+        CHECK(got[i].quantity == sent[i].quantity);
+        CHECK(got[i].participant == sent[i].participant);
     }
     std::cout << "test_wire_round_trips_every_request_type passed\n";
 }
@@ -1032,16 +1050,16 @@ void test_framing_is_identical_at_every_possible_split() {
                                        limitRequest(2, 11, Side::Sell, 101'00, 6, 9),
                                        limitRequest(3, 12, Side::Buy, 99'00, 7, 0)};
     const std::vector<std::uint8_t> bytes = encodeAll(sent);
-    assert(bytes.size() > kHeaderBytes * 3);
+    CHECK(bytes.size() > kHeaderBytes * 3);
 
     for (std::size_t split = 0; split <= bytes.size(); ++split) {
         const std::vector<Request> got = readSplitAt(bytes, split);
-        assert(got.size() == sent.size());
+        CHECK(got.size() == sent.size());
         for (std::size_t i = 0; i < sent.size(); ++i) {
-            assert(got[i].correlation_id == sent[i].correlation_id);
-            assert(got[i].order_id == sent[i].order_id);
-            assert(got[i].price == sent[i].price);
-            assert(got[i].quantity == sent[i].quantity);
+            CHECK(got[i].correlation_id == sent[i].correlation_id);
+            CHECK(got[i].order_id == sent[i].order_id);
+            CHECK(got[i].price == sent[i].price);
+            CHECK(got[i].quantity == sent[i].quantity);
         }
     }
     std::cout << "test_framing_is_identical_at_every_possible_split passed\n";
@@ -1049,7 +1067,7 @@ void test_framing_is_identical_at_every_possible_split() {
 
 void test_framing_yields_nothing_until_a_frame_is_complete() {
     std::vector<std::uint8_t> bytes;
-    assert(encodeRequest(limitRequest(1, 10, Side::Buy, 100'00, 5, 7), bytes));
+    CHECK(encodeRequest(limitRequest(1, 10, Side::Buy, 100'00, 5, 7), bytes));
 
     FrameReader reader;
     MessageType type;
@@ -1058,18 +1076,18 @@ void test_framing_yields_nothing_until_a_frame_is_complete() {
 
     // One byte short: still nothing, and still not a failure.
     reader.append(bytes.data(), bytes.size() - 1);
-    assert(!reader.next(type, correlation, payload));
-    assert(!reader.failed());
+    CHECK(!reader.next(type, correlation, payload));
+    CHECK(!reader.failed());
 
     reader.append(bytes.data() + bytes.size() - 1, 1);
-    assert(reader.next(type, correlation, payload));
-    assert(!reader.next(type, correlation, payload));  // and only the one
+    CHECK(reader.next(type, correlation, payload));
+    CHECK(!reader.next(type, correlation, payload));  // and only the one
     std::cout << "test_framing_yields_nothing_until_a_frame_is_complete passed\n";
 }
 
 void test_framing_rejects_bad_version_and_oversized_payloads() {
     std::vector<std::uint8_t> bytes;
-    assert(encodeRequest(limitRequest(1, 10, Side::Buy, 100'00, 5, 7), bytes));
+    CHECK(encodeRequest(limitRequest(1, 10, Side::Buy, 100'00, 5, 7), bytes));
 
     {
         std::vector<std::uint8_t> corrupt = bytes;
@@ -1079,8 +1097,8 @@ void test_framing_rejects_bad_version_and_oversized_payloads() {
         std::uint32_t correlation = 0;
         std::vector<std::uint8_t> payload;
         reader.append(corrupt.data(), corrupt.size());
-        assert(!reader.next(type, correlation, payload));
-        assert(reader.failed());
+        CHECK(!reader.next(type, correlation, payload));
+        CHECK(reader.failed());
     }
     {
         // A client claiming a huge payload must not make the server buffer it.
@@ -1094,8 +1112,8 @@ void test_framing_rejects_bad_version_and_oversized_payloads() {
         std::uint32_t correlation = 0;
         std::vector<std::uint8_t> payload;
         reader.append(corrupt.data(), corrupt.size());
-        assert(!reader.next(type, correlation, payload));
-        assert(reader.failed());
+        CHECK(!reader.next(type, correlation, payload));
+        CHECK(reader.failed());
     }
     std::cout << "test_framing_rejects_bad_version_and_oversized_payloads passed\n";
 }
@@ -1103,13 +1121,13 @@ void test_framing_rejects_bad_version_and_oversized_payloads() {
 void test_decode_rejects_wrong_payload_length() {
     std::vector<std::uint8_t> payload(4, 0);  // far too short for a limit order
     Request request;
-    assert(!decodeRequest(MessageType::LimitOrder, 1, payload.data(), payload.size(), request));
+    CHECK(!decodeRequest(MessageType::LimitOrder, 1, payload.data(), payload.size(), request));
 
     // Trailing bytes are rejected too: they mean the ends disagree on format.
     std::vector<std::uint8_t> bytes;
-    assert(encodeRequest(limitRequest(1, 10, Side::Buy, 100'00, 5, 7), bytes));
+    CHECK(encodeRequest(limitRequest(1, 10, Side::Buy, 100'00, 5, 7), bytes));
     const std::size_t body = bytes.size() - kHeaderBytes;
-    assert(!decodeRequest(MessageType::LimitOrder, 1, bytes.data() + kHeaderBytes, body + 1, request));
+    CHECK(!decodeRequest(MessageType::LimitOrder, 1, bytes.data() + kHeaderBytes, body + 1, request));
     std::cout << "test_decode_rejects_wrong_payload_length passed\n";
 }
 
@@ -1117,8 +1135,8 @@ void test_encode_rejects_an_over_long_symbol() {
     Request request = limitRequest(1, 10, Side::Buy, 100'00, 5, 7);
     request.symbol = "TOOLONGSYMBOL";  // truncating would alias two instruments
     std::vector<std::uint8_t> bytes;
-    assert(!encodeRequest(request, bytes));
-    assert(bytes.empty());  // and nothing half-written is left behind
+    CHECK(!encodeRequest(request, bytes));
+    CHECK(bytes.empty());  // and nothing half-written is left behind
     std::cout << "test_encode_rejects_an_over_long_symbol passed\n";
 }
 
@@ -1138,8 +1156,8 @@ void test_response_round_trips_with_trades() {
     sweep.participant = kBob;
 
     const Response sent = applyRequest(sweep, engine);
-    assert(sent.trades.size() == 2);
-    assert(sent.unfilled == 2);
+    CHECK(sent.trades.size() == 2);
+    CHECK(sent.unfilled == 2);
 
     std::vector<std::uint8_t> bytes;
     encodeResponse(sent, bytes);
@@ -1149,20 +1167,20 @@ void test_response_round_trips_with_trades() {
     std::uint32_t correlation = 0;
     std::vector<std::uint8_t> payload;
     reader.append(bytes.data(), bytes.size());
-    assert(reader.next(type, correlation, payload));
-    assert(type == MessageType::Response);
+    CHECK(reader.next(type, correlation, payload));
+    CHECK(type == MessageType::Response);
 
     Response got;
-    assert(decodeResponse(correlation, payload.data(), payload.size(), got));
-    assert(got.correlation_id == 99);
-    assert(got.reason == RejectReason::None);
-    assert(got.unfilled == sent.unfilled);
-    assert(got.trades.size() == sent.trades.size());
+    CHECK(decodeResponse(correlation, payload.data(), payload.size(), got));
+    CHECK(got.correlation_id == 99);
+    CHECK(got.reason == RejectReason::None);
+    CHECK(got.unfilled == sent.unfilled);
+    CHECK(got.trades.size() == sent.trades.size());
     for (std::size_t i = 0; i < sent.trades.size(); ++i) {
-        assert(got.trades[i].buy_order_id == sent.trades[i].buy_order_id);
-        assert(got.trades[i].sell_order_id == sent.trades[i].sell_order_id);
-        assert(got.trades[i].price == sent.trades[i].price);
-        assert(got.trades[i].quantity == sent.trades[i].quantity);
+        CHECK(got.trades[i].buy_order_id == sent.trades[i].buy_order_id);
+        CHECK(got.trades[i].sell_order_id == sent.trades[i].sell_order_id);
+        CHECK(got.trades[i].price == sent.trades[i].price);
+        CHECK(got.trades[i].quantity == sent.trades[i].quantity);
     }
     std::cout << "test_response_round_trips_with_trades passed\n";
 }
@@ -1172,18 +1190,18 @@ void test_apply_request_reports_rejections_over_the_wire() {
 
     Request unknown = limitRequest(1, 10, Side::Buy, 100'00, 5, 7);  // AAPL not registered
     Response response = applyRequest(unknown, engine);
-    assert(response.reason == RejectReason::UnknownSymbol);
-    assert(response.unfilled == 5);
+    CHECK(response.reason == RejectReason::UnknownSymbol);
+    CHECK(response.unfilled == 5);
 
     Request add;
     add.type = MessageType::AddSymbol;
     add.symbol = "AAPL";
-    assert(applyRequest(add, engine).reason == RejectReason::None);
-    assert(applyRequest(add, engine).reason != RejectReason::None);  // already registered
+    CHECK(applyRequest(add, engine).reason == RejectReason::None);
+    CHECK(applyRequest(add, engine).reason != RejectReason::None);  // already registered
 
-    assert(applyRequest(limitRequest(2, 10, Side::Buy, 100'00, 5, 7), engine).reason ==
+    CHECK(applyRequest(limitRequest(2, 10, Side::Buy, 100'00, 5, 7), engine).reason ==
            RejectReason::None);
-    assert(applyRequest(limitRequest(3, 10, Side::Buy, 99'00, 5, 7), engine).reason ==
+    CHECK(applyRequest(limitRequest(3, 10, Side::Buy, 99'00, 5, 7), engine).reason ==
            RejectReason::DuplicateOrderId);
     std::cout << "test_apply_request_reports_rejections_over_the_wire passed\n";
 }

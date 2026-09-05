@@ -1,4 +1,6 @@
-# matching-engine
+# limit-order-book
+
+[![CI](https://github.com/athul1810/limit-order-book/actions/workflows/ci.yml/badge.svg)](https://github.com/athul1810/limit-order-book/actions/workflows/ci.yml)
 
 A single-instrument limit order book with price-time priority matching, written in C++17.
 
@@ -323,6 +325,25 @@ negative prices, a second connection seeing the same book, and state surviving a
 restart. It found a real bug the C++ tests could not: `poll()` was being indexed by a
 connection count that `accept()` had already grown, so a newly accepted connection
 read past the end of the descriptor array and was dropped on the spot.
+
+## Tests and CI
+
+```bash
+./test_runner                                              # unit tests
+python3 tests/wire_smoke_test.py ./matching_engine_server   # protocol, over a real socket
+```
+
+CI builds with GCC and Clang on Linux and Clang on macOS, with `-Wpedantic -Werror`,
+and runs the unit tests, the wire integration test, a CLI restart-recovery check, and
+a short benchmark. Three toolchains rather than one because that is where a whole
+class of bug lives: a standard-library symbol used without including its header
+compiles fine under whichever implementation you happened to develop against, and
+fails on the other. Adding CI turned up six such cases in this repository.
+
+The unit tests use a `CHECK` macro rather than `assert`. `assert` expands to nothing
+when `NDEBUG` is defined, and `NDEBUG` is exactly what a CMake `Release` build
+defines — so an assert-based suite compiled in Release prints "passed" for every test
+while verifying nothing. `CHECK` is evaluated in every build type.
 
 ## Roadmap
 
