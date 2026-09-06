@@ -160,6 +160,7 @@ def clean_env(overrides=None):
     env.pop("MATCHING_ENGINE_TLS_CERT", None)
     env.pop("MATCHING_ENGINE_TLS_KEY", None)
     env.pop("MATCHING_ENGINE_TLS_HANDSHAKE_TIMEOUT_SECONDS", None)
+    env.pop("MATCHING_ENGINE_TLS_CLIENT_CA", None)
     if overrides:
         env.update(overrides)
     return env
@@ -218,15 +219,40 @@ def free_port():
         return s.getsockname()[1]
 
 
-def generate_self_signed_cert(cert_path, key_path):
+def generate_self_signed_cert(cert_path, key_path, subject="/CN=localhost"):
     # Shells out to the openssl CLI rather than a Python crypto library:
     # this test file otherwise has zero dependencies beyond the standard
     # library, and openssl itself is a safe thing to assume is on hand for
     # testing a server that, in this mode, links OpenSSL to run at all.
     subprocess.run(
         ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-keyout", key_path, "-out", cert_path,
-         "-days", "1", "-nodes", "-subj", "/CN=localhost"],
+         "-days", "1", "-nodes", "-subj", subject],
         check=True, capture_output=True, timeout=30)
+
+
+def generate_ca_signed_client_cert(workdir, ca_cert_path, ca_key_path, client_cert_path, client_key_path):
+    # A client certificate mutual TLS should accept: a real CSR, signed by
+    # the same CA the server is configured to trust -- not another
+    # self-signed cert, which is exactly what the "rogue" cert below is for
+    # (verifying the server actually checks the signer, not just "is this a
+    # certificate at all").
+    csr_path = os.path.join(workdir, "client_csr.pem")
+    subprocess.run(
+        ["openssl", "req", "-newkey", "rsa:2048", "-keyout", client_key_path, "-out", csr_path,
+         "-nodes", "-subj", "/CN=test-client"],
+        check=True, capture_output=True, timeout=30)
+    subprocess.run(
+        ["openssl", "x509", "-req", "-in", csr_path, "-CA", ca_cert_path, "-CAkey", ca_key_path,
+         "-CAcreateserial", "-out", client_cert_path, "-days", "1"],
+        check=True, capture_output=True, timeout=30)
+
+
+def wrap_tls_with_client_cert(sock, cert_path, key_path):
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.load_cert_chain(cert_path, key_path)
+    return ctx.wrap_socket(sock, server_hostname="localhost")
 
 
 def wrap_tls(sock):
@@ -645,6 +671,72 @@ def main():
             check("an established TLS connection is unaffected by the handshake timeout",
                   read_response(established)["reason"], "ok")
             established.close()
+        finally:
+            stop_server(proc, out)
+
+        # ---- mutual TLS ----
+        # A fresh CA, a client cert it signed, and a "rogue" client cert it
+        # did not -- the rogue one is what actually proves the server checks
+        # the signer, not just "is this a certificate at all".
+        ca_cert_path = os.path.join(workdir, "ca_cert.pem")
+        ca_key_path = os.path.join(workdir, "ca_key.pem")
+        generate_self_signed_cert(ca_cert_path, ca_key_path, subject="/CN=Test CA")
+        client_cert_path = os.path.join(workdir, "client_cert.pem")
+        client_key_path = os.path.join(workdir, "client_key.pem")
+        generate_ca_signed_client_cert(workdir, ca_cert_path, ca_key_path, client_cert_path, client_key_path)
+        rogue_cert_path = os.path.join(workdir, "rogue_cert.pem")
+        rogue_key_path = os.path.join(workdir, "rogue_key.pem")
+        generate_self_signed_cert(rogue_cert_path, rogue_key_path, subject="/CN=rogue-client")
+
+        # A client CA with no server cert to pair it with isn't a coherent
+        # setting -- refused before mutual TLS is even relevant.
+        client_ca_alone_refused = expect_start_failure(
+            binary, free_port(), os.path.join(workdir, "mtls_alone.log"),
+            {"MATCHING_ENGINE_TLS_CLIENT_CA": ca_cert_path},
+            "requires MATCHING_ENGINE_TLS_CERT")
+        check("client CA alone, with no server cert, is refused", client_ca_alone_refused, True)
+
+        mtls_port = free_port()
+        mtls_env = {"MATCHING_ENGINE_TLS_CERT": cert_path, "MATCHING_ENGINE_TLS_KEY": key_path,
+                   "MATCHING_ENGINE_TLS_CLIENT_CA": ca_cert_path}
+        proc, out = start_server(binary, mtls_port, os.path.join(workdir, "mtls.log"),
+                                 os.path.join(workdir, "mtls.out"), env_overrides=mtls_env)
+        try:
+            # Under TLS 1.3, a server that rejects a missing/invalid client
+            # certificate does not necessarily fail during the client's own
+            # wrap_socket() call: the client can consider its side of the
+            # handshake done and return before the server's rejection --
+            # sent once it processes the client's Certificate message --
+            # actually arrives. The rejection reliably surfaces by the first
+            # read or write after, which is why each check below wraps the
+            # handshake *and* a round trip attempt in one try, rather than
+            # expecting wrap_socket() alone to raise.
+            no_cert_rejected = False
+            raw = socket.create_connection(("127.0.0.1", mtls_port), timeout=5)
+            try:
+                e = wrap_tls(raw)
+                e.sendall(add_symbol(1, "AAPL"))
+                e.recv(64)
+            except OSError:
+                no_cert_rejected = True
+            check("mutual TLS rejects a connection with no client certificate", no_cert_rejected, True)
+
+            rogue_rejected = False
+            raw2 = socket.create_connection(("127.0.0.1", mtls_port), timeout=5)
+            try:
+                e2 = wrap_tls_with_client_cert(raw2, rogue_cert_path, rogue_key_path)
+                e2.sendall(add_symbol(2, "AAPL"))
+                e2.recv(64)
+            except OSError:
+                rogue_rejected = True
+            check("mutual TLS rejects a client certificate the CA didn't sign", rogue_rejected, True)
+
+            raw3 = socket.create_connection(("127.0.0.1", mtls_port), timeout=5)
+            e3 = wrap_tls_with_client_cert(raw3, client_cert_path, client_key_path)
+            e3.sendall(add_symbol(1, "AAPL"))
+            check("mutual TLS accepts a correctly CA-signed client certificate",
+                  read_response(e3)["reason"], "ok")
+            e3.close()
         finally:
             stop_server(proc, out)
 

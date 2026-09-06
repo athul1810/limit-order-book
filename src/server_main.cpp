@@ -117,6 +117,17 @@ int main(int argc, char** argv) {
         if (parsed > 0) tls_handshake_timeout = std::chrono::seconds(parsed);
     }
 
+    // Requires TLS itself to already be configured: a client CA with no
+    // server certificate to pair it with isn't a coherent setting, so it is
+    // refused the same way a lone MATCHING_ENGINE_TLS_CERT is above.
+    const char* tls_client_ca_env = std::getenv("MATCHING_ENGINE_TLS_CLIENT_CA");
+    const bool has_tls_client_ca = tls_client_ca_env != nullptr && *tls_client_ca_env != '\0';
+    if (has_tls_client_ca && !tls_requested) {
+        std::cerr << "MATCHING_ENGINE_TLS_CLIENT_CA requires MATCHING_ENGINE_TLS_CERT and "
+                    "MATCHING_ENGINE_TLS_KEY to also be set.\n";
+        return 1;
+    }
+
     MatchingEngine engine;
 
     // Same recovery path as the CLI -- see recovery.hpp. A server that
@@ -152,7 +163,8 @@ int main(int argc, char** argv) {
     // chance of one arriving.
     if (tls_requested) {
         std::string tls_error;
-        if (!server.enableTls(tls_cert_env, tls_key_env, tls_error, tls_handshake_timeout)) {
+        if (!server.enableTls(tls_cert_env, tls_key_env, tls_error, tls_handshake_timeout,
+                             has_tls_client_ca ? tls_client_ca_env : "")) {
             std::cerr << "cannot enable TLS: " << tls_error << "\n";
             return 1;
         }
@@ -190,6 +202,7 @@ int main(int argc, char** argv) {
 
     std::cout << "listening on " << bind_address << ":" << server.boundPort();
     if (tls_requested) std::cout << " (TLS enabled)";
+    if (has_tls_client_ca) std::cout << " (client certificate required)";
     if (required_token.has_value()) std::cout << " (authentication required)";
     if (!log_path.empty()) std::cout << ", logging to " << log_path;
     std::cout << "\nCtrl-C to stop.\n";

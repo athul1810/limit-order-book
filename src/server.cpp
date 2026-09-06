@@ -50,9 +50,19 @@ OrderServer::~OrderServer() {
 }
 
 bool OrderServer::enableTls(const std::string& cert_path, const std::string& key_path,
-                           std::string& error, std::chrono::steady_clock::duration handshake_timeout) {
-    tls_context_ = TlsContext::create(cert_path, key_path, error);
-    if (tls_context_ == nullptr) return false;
+                           std::string& error, std::chrono::steady_clock::duration handshake_timeout,
+                           const std::string& client_ca_path) {
+    std::unique_ptr<TlsContext> context = TlsContext::create(cert_path, key_path, error);
+    if (context == nullptr) return false;
+    if (!client_ca_path.empty() && !context->requireClientCertificate(client_ca_path, error)) {
+        // Enabling is all-or-nothing: a client CA that fails to load must
+        // not leave the server running with TLS on but mutual TLS silently
+        // absent, which is what stopping here without ever assigning to
+        // tls_context_ guarantees -- this local `context` is simply
+        // discarded.
+        return false;
+    }
+    tls_context_ = std::move(context);
     tls_handshake_timeout_ = handshake_timeout;
     return true;
 }

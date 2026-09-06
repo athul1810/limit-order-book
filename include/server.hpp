@@ -132,13 +132,22 @@ class OrderServer {
     // (in practice, before it is called at all) -- a connection already
     // accepted in plaintext cannot be retroactively upgraded.
     //
-    // False (with `error` set) if the certificate/key can't be loaded, or if
-    // this binary was not built with TLS support at all (CMake's WITH_TLS
-    // option; see tls.hpp's tlsSupported()) -- the two are deliberately
-    // reported the same way, since both mean "TLS is not available", and a
-    // caller's response to either is the same: don't start.
+    // `client_ca_path`, left empty (the default), leaves client
+    // certificates optional -- unrequested, in fact, matching this
+    // project's behaviour before mutual TLS existed at all. Non-empty
+    // requires every connection to present one, verified against that CA;
+    // see TlsContext::requireClientCertificate for exactly what that means.
+    //
+    // False (with `error` set) if the certificate/key or the client CA (if
+    // given) can't be loaded, or if this binary was not built with TLS
+    // support at all (CMake's WITH_TLS option; see tls.hpp's
+    // tlsSupported()) -- deliberately reported the same way in every case,
+    // since a caller's response to any of them is the same: don't start.
+    // Enabling never partially succeeds: a client CA that fails to load
+    // leaves TLS disabled entirely, not enabled without it.
     bool enableTls(const std::string& cert_path, const std::string& key_path, std::string& error,
-                   std::chrono::steady_clock::duration handshake_timeout = kDefaultTlsHandshakeTimeout);
+                   std::chrono::steady_clock::duration handshake_timeout = kDefaultTlsHandshakeTimeout,
+                   const std::string& client_ca_path = "");
 
    private:
     struct Connection {

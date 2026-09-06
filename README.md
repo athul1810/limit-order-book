@@ -48,7 +48,9 @@ interview, not a black box.
   and a way to recover from a gap without having to re-subscribe.
 - **Encryption**: optional TLS on the server socket, so the token authentication
   checks isn't sent in plain text off loopback. Off by default, and off entirely
-  unless the binary was built with OpenSSL linked in.
+  unless the binary was built with OpenSSL linked in. A connection stuck mid-handshake
+  is dropped after a timeout rather than occupying a slot forever, and mutual TLS can
+  require a client certificate as a second, independent layer alongside the token.
 
 ## Design
 
@@ -189,6 +191,11 @@ interview, not a black box.
   which a connection stuck in its handshake, by definition, never does on its own
   -- checking it there would mean a silent connection's timeout never actually
   fires until some unrelated connection happens to wake `poll()` up first.
+- Enabling TLS is all-or-nothing. A client CA that fails to load leaves the server
+  with TLS off entirely, not on without mutual TLS -- `OrderServer::enableTls`
+  never assigns its `TlsContext` until every piece it was asked to configure has
+  actually succeeded, so a caller can't end up running with a quieter security
+  posture than it asked for just because one setting among several was wrong.
 
 ## What's deliberately left out (for now)
 
@@ -581,6 +588,28 @@ occupying a connection slot forever. An established connection is never affected
 this, no matter how long it then sits idle: the timeout only ever looks at
 connections still mid-handshake.
 
+#### Mutual TLS
+
+`MATCHING_ENGINE_TLS_CLIENT_CA` requires every connection to present a client
+certificate, verified against the CA in that file, before anything else is accepted --
+a second, independent layer alongside the shared-token `Authenticate` flow, not a
+replacement for it. Requires `MATCHING_ENGINE_TLS_CERT`/`_KEY` to already be set;
+a client CA with no server certificate to pair it with is refused outright:
+
+```bash
+MATCHING_ENGINE_TLS_CERT=cert.pem MATCHING_ENGINE_TLS_KEY=key.pem \
+    MATCHING_ENGINE_TLS_CLIENT_CA=ca.pem ./matching_engine_server 9001 book.log
+listening on 127.0.0.1:9001 (TLS enabled) (client certificate required), logging to book.log
+```
+
+A connection presenting no certificate, or one the configured CA didn't sign, is
+rejected -- though not necessarily during the handshake itself. Under TLS 1.3, a
+client can consider its own side of the handshake done and return before the
+server's rejection, sent once it has actually processed the client's certificate
+message, arrives back; the rejection reliably surfaces on the first read or write
+after, not necessarily the handshake call itself. This is a property of the protocol,
+not a delay this server introduces.
+
 ## Tests and CI
 
 ```bash
@@ -659,10 +688,5 @@ written and installed before the log is ever touched) instead of reusing it.
 ## Roadmap
 
 Every item this section originally listed has since been built. What would come next
-with more time:
-
-1. Mutual TLS: the server already presents a certificate; a client could be required
-   to present one too, as an alternative or a complement to the shared-token
-   authentication that exists today
-2. Reloading a renewed certificate without restarting the process, for a deployment
-   that would rather not schedule downtime around a certificate's expiry
+with more time: reloading a renewed certificate without restarting the process, for
+a deployment that would rather not schedule downtime around a certificate's expiry.

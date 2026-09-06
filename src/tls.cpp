@@ -116,6 +116,19 @@ std::unique_ptr<TlsContext> TlsContext::create(const std::string& cert_path,
 
 TlsContext::~TlsContext() = default;
 
+bool TlsContext::requireClientCertificate(const std::string& ca_path, std::string& error) {
+    if (SSL_CTX_load_verify_locations(impl_->ctx, ca_path.c_str(), nullptr) != 1) {
+        error = "loading client CA '" + ca_path + "': " + lastOpenSslError();
+        return false;
+    }
+    // FAIL_IF_NO_PEER_CERT is what actually makes this mandatory rather than
+    // merely requested: without it, VERIFY_PEER alone still accepts a
+    // handshake that presented no certificate at all, verifying only the
+    // ones that were.
+    SSL_CTX_set_verify(impl_->ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, nullptr);
+    return true;
+}
+
 std::unique_ptr<TlsConnection> TlsContext::wrap(int fd) {
     SSL* ssl = SSL_new(impl_->ctx);
     if (ssl == nullptr) return nullptr;
@@ -223,6 +236,12 @@ std::unique_ptr<TlsContext> TlsContext::create(const std::string& cert_path,
 }
 
 TlsContext::~TlsContext() = default;
+
+bool TlsContext::requireClientCertificate(const std::string& ca_path, std::string& error) {
+    (void)ca_path;
+    error = "this binary was not built with TLS support (rebuild with -DWITH_TLS=ON)";
+    return false;
+}
 
 std::unique_ptr<TlsConnection> TlsContext::wrap(int fd) {
     (void)fd;

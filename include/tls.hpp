@@ -66,6 +66,22 @@ class TlsContext {
     // a context that came back from a successful create().
     std::unique_ptr<TlsConnection> wrap(int fd);
 
+    // Requires every connection wrapped from here on to present a client
+    // certificate, verified against the CA certificate(s) in `ca_path` (a
+    // PEM file; more than one CA can simply be concatenated in it). A
+    // connection that presents none, or one that doesn't verify against
+    // this CA, fails its handshake exactly like a peer not speaking TLS at
+    // all does. False (with `error` set) if `ca_path` can't be loaded --
+    // call before wrap() is ever called, in practice right after create().
+    //
+    // This is a second, independent layer alongside whatever
+    // application-level authentication OrderServer itself is configured
+    // with (wire.hpp's Authenticate): it neither substitutes for nor is
+    // substituted by a correct token. A source can be required to prove
+    // both who signed its certificate and that it knows a shared secret,
+    // since those are two different claims.
+    bool requireClientCertificate(const std::string& ca_path, std::string& error);
+
    private:
     TlsContext() = default;
     struct Impl;
