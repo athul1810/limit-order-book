@@ -96,6 +96,20 @@ int main(int argc, char** argv) {
         if (parsed > 0) market_data_history_limit = static_cast<std::size_t>(parsed);
     }
 
+    // Both or neither: one set without the other is almost certainly a typo
+    // (a copy-pasted env block missing a line), not a deliberate "half of
+    // TLS" configuration, so it is refused rather than silently left off.
+    const char* tls_cert_env = std::getenv("MATCHING_ENGINE_TLS_CERT");
+    const char* tls_key_env = std::getenv("MATCHING_ENGINE_TLS_KEY");
+    const bool has_tls_cert = tls_cert_env != nullptr && *tls_cert_env != '\0';
+    const bool has_tls_key = tls_key_env != nullptr && *tls_key_env != '\0';
+    if (has_tls_cert != has_tls_key) {
+        std::cerr << "MATCHING_ENGINE_TLS_CERT and MATCHING_ENGINE_TLS_KEY must both be set to "
+                    "enable TLS, or neither to leave it off.\n";
+        return 1;
+    }
+    const bool tls_requested = has_tls_cert && has_tls_key;
+
     MatchingEngine engine;
 
     // Same recovery path as the CLI -- see recovery.hpp. A server that
@@ -125,6 +139,17 @@ int main(int argc, char** argv) {
 
     OrderServer server(engine, required_token, max_auth_failures, auth_lockout_duration, market_data_depth,
                        market_data_history_limit);
+
+    // Before listenOn(): a connection accepted in plaintext can't be
+    // retroactively upgraded, so TLS has to be enabled before there is any
+    // chance of one arriving.
+    if (tls_requested) {
+        std::string tls_error;
+        if (!server.enableTls(tls_cert_env, tls_key_env, tls_error)) {
+            std::cerr << "cannot enable TLS: " << tls_error << "\n";
+            return 1;
+        }
+    }
 
     // Unlike the CLI, the server has a genuine idle tick (the poll loop's
     // own timeout) independent of request traffic, so a wall-clock trigger
@@ -157,6 +182,7 @@ int main(int argc, char** argv) {
     std::signal(SIGTERM, handleSignal);
 
     std::cout << "listening on " << bind_address << ":" << server.boundPort();
+    if (tls_requested) std::cout << " (TLS enabled)";
     if (required_token.has_value()) std::cout << " (authentication required)";
     if (!log_path.empty()) std::cout << ", logging to " << log_path;
     std::cout << "\nCtrl-C to stop.\n";

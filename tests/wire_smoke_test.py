@@ -10,6 +10,7 @@ Run it against a built server:
 import os
 import shutil
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -156,6 +157,8 @@ def clean_env(overrides=None):
     env.pop("MATCHING_ENGINE_AUTH_LOCKOUT_SECONDS", None)
     env.pop("MATCHING_ENGINE_MARKET_DATA_DEPTH", None)
     env.pop("MATCHING_ENGINE_MARKET_DATA_HISTORY_LIMIT", None)
+    env.pop("MATCHING_ENGINE_TLS_CERT", None)
+    env.pop("MATCHING_ENGINE_TLS_KEY", None)
     if overrides:
         env.update(overrides)
     return env
@@ -212,6 +215,28 @@ def free_port():
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+def generate_self_signed_cert(cert_path, key_path):
+    # Shells out to the openssl CLI rather than a Python crypto library:
+    # this test file otherwise has zero dependencies beyond the standard
+    # library, and openssl itself is a safe thing to assume is on hand for
+    # testing a server that, in this mode, links OpenSSL to run at all.
+    subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-keyout", key_path, "-out", cert_path,
+         "-days", "1", "-nodes", "-subj", "/CN=localhost"],
+        check=True, capture_output=True, timeout=30)
+
+
+def wrap_tls(sock):
+    # CERT_NONE and hostname checking off: this is verifying the connection
+    # is actually encrypted end-to-end, not standing up a trust chain --
+    # the cert above is self-signed and would fail real verification by
+    # design, the same as any other self-signed test cert would.
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx.wrap_socket(sock, server_hostname="localhost")
 
 
 def main():
@@ -535,6 +560,65 @@ def main():
         c.close()
     finally:
         stop_server(proc, out)
+
+    # ---- TLS ----
+    # Setting only one of the pair is refused before either TLS or a build
+    # without it is even relevant -- server_main.cpp checks this first.
+    partial_tls_refused = expect_start_failure(
+        binary, free_port(), os.path.join(workdir, "partial_tls.log"),
+        {"MATCHING_ENGINE_TLS_CERT": "/nonexistent/cert.pem"},
+        "must both be set")
+    check("TLS refused when only the cert is set", partial_tls_refused, True)
+
+    cert_path = os.path.join(workdir, "test_cert.pem")
+    key_path = os.path.join(workdir, "test_key.pem")
+    generate_self_signed_cert(cert_path, key_path)
+
+    tls_port = free_port()
+    tls_env = {"MATCHING_ENGINE_TLS_CERT": cert_path, "MATCHING_ENGINE_TLS_KEY": key_path}
+    try:
+        proc, out = start_server(binary, tls_port, os.path.join(workdir, "tls.log"),
+                                 os.path.join(workdir, "tls.out"), env_overrides=tls_env)
+    except RuntimeError:
+        # This binary was built without WITH_TLS -- server_main.cpp refuses
+        # to start rather than silently falling back to plaintext, which is
+        # exactly what this checks, then stops: nothing below this point can
+        # run against a binary that has no TLS support to exercise.
+        with open(os.path.join(workdir, "tls.out")) as f:
+            startup_output = f.read()
+        check("TLS-less binary refuses to start with TLS configured",
+              "not built with TLS support" in startup_output, True)
+    else:
+        try:
+            raw = socket.create_connection(("127.0.0.1", tls_port), timeout=5)
+            e = wrap_tls(raw)
+            check("TLS handshake negotiates a real protocol version",
+                  e.version() in ("TLSv1.2", "TLSv1.3"), True)
+
+            e.sendall(add_symbol(1, "AAPL"))
+            check("AddSymbol over TLS", read_response(e)["reason"], "ok")
+            e.sendall(limit(2, "AAPL", 100, 1, 10050, 5, 0))
+            check("LimitOrder over TLS", read_response(e)["reason"], "ok")
+            e.close()
+
+            # A plaintext client's bytes are not a valid TLS ClientHello, so
+            # the handshake fails and the connection is dropped -- the
+            # server itself must not be affected, which the next check
+            # (a fresh, correct TLS connection working right after) confirms.
+            plain = socket.create_connection(("127.0.0.1", tls_port), timeout=5)
+            plain.sendall(add_symbol(9, "AAPL"))
+            check("plaintext client against a TLS server gets dropped",
+                  read_after_close_probe(plain, timeout=3), "closed")
+            plain.close()
+
+            raw2 = socket.create_connection(("127.0.0.1", tls_port), timeout=5)
+            e2 = wrap_tls(raw2)
+            e2.sendall(add_symbol(10, "MSFT"))
+            check("server survives a rejected plaintext connection",
+                  read_response(e2)["reason"], "ok")
+            e2.close()
+        finally:
+            stop_server(proc, out)
 
     shutil.rmtree(workdir, ignore_errors=True)
     print()

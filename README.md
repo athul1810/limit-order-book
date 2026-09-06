@@ -46,6 +46,9 @@ interview, not a black box.
   of its current best bid/ask and depth, then a push after every subsequent trade or
   resting order that touches it, with a sequence number for detecting a missed one
   and a way to recover from a gap without having to re-subscribe.
+- **Encryption**: optional TLS on the server socket, so the token authentication
+  checks isn't sent in plain text off loopback. Off by default, and off entirely
+  unless the binary was built with OpenSSL linked in.
 
 ## Design
 
@@ -154,6 +157,33 @@ interview, not a black box.
   out when the socket is writable again, so `POLLOUT` is only requested when there
   is something pending, or `poll()` would return immediately forever.
 
+- TLS is pimpl'd behind `tls.hpp` specifically so `server.hpp` -- and everything
+  that includes it -- never has to see an OpenSSL header, in either build mode.
+  `tls.cpp` always compiles; whether it actually links OpenSSL depends on a
+  preprocessor macro CMake's `WITH_TLS` option defines, so a build without it
+  produces a binary that still calls the same functions and gets a clean "not
+  built with TLS support" error back, rather than every caller needing its own
+  `#ifdef`.
+- The handshake is driven from `poll()`, not blocked on: `SSL_accept` under a
+  non-blocking fd returns "would block in this direction" rather than actually
+  blocking, and a connection sits in a `Handshaking` state until it reports done.
+  A blocking handshake would violate the same principle the single-threaded
+  design itself rests on -- one slow or hostile TLS client stalling the handshake
+  would stall every other connection's I/O too, in exactly the boundary that is
+  supposed to be where concurrency lives.
+- Both a TLS handshake step and, occasionally, an established connection's own
+  read or write can need to poll the *opposite* direction from what a raw socket
+  would (a write that needs to read, or vice versa) -- unlike a plain TCP read,
+  which always waits on readability. Rather than tracking exactly which direction
+  is pending, the server polls both whenever either is needed, accepting an
+  occasional spurious wakeup as the cost of never guessing the wrong direction and
+  stalling a connection until an unrelated event happens to wake it.
+- `SSL_CTX_set_mode` sets both `SSL_MODE_ENABLE_PARTIAL_WRITE` and
+  `SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER`. Responses are buffered per connection (see
+  above), and a broadcast can append more bytes to that buffer between one write
+  attempt and its retry -- exactly the "growing buffer" shape OpenSSL's default,
+  stricter contract (retry with the identical pointer and length) doesn't allow.
+
 ## What's deliberately left out (for now)
 
 This is a matching core, not a trading system. Missing on purpose, not by oversight:
@@ -165,11 +195,6 @@ This is a matching core, not a trading system. Missing on purpose, not by oversi
   record, so it survives the process dying, but it is not `fsync`'d, so it does not
   survive the machine dying. Closing that needs a real file descriptor, which is out
   of reach of a `std::ostream`
-- Encryption on the wire. The token that authentication checks travels in plain text,
-  so it is only meaningfully secret on a link nothing else can observe, which loopback
-  is and a routable network generally is not. Encrypting the connection itself (TLS,
-  most plausibly) is a separate piece of work from checking a credential once it
-  arrives, and is still missing
 - Windows. The server uses POSIX sockets and `poll()`
 - Concurrency: the book is single-threaded by design; a real engine gets its
   concurrency at the I/O boundary, not inside the matching core itself. Per-symbol
@@ -178,7 +203,8 @@ This is a matching core, not a trading system. Missing on purpose, not by oversi
 
 ## Build and run
 
-Requires a C++17 compiler. No external dependencies.
+Requires a C++17 compiler. No external dependencies by default; OpenSSL only if you
+opt into TLS (see "Encryption on the wire" further down).
 
 ```bash
 # Compile everything directly (no CMake required). Each target only needs the
@@ -186,7 +212,7 @@ Requires a C++17 compiler. No external dependencies.
 # benchmark doesn't touch persistence recovery at all.
 g++ -std=c++17 -O2 -Iinclude src/order_book.cpp src/matching_engine.cpp \
     src/event_log.cpp src/snapshot.cpp src/wire.cpp src/recovery.cpp \
-    src/compaction.cpp tests/test_order_book.cpp -o test_runner
+    src/compaction.cpp src/tls.cpp tests/test_order_book.cpp -o test_runner
 g++ -std=c++17 -O2 -Iinclude src/order_book.cpp src/matching_engine.cpp \
     src/event_log.cpp src/snapshot.cpp src/recovery.cpp src/compaction.cpp \
     src/main.cpp -o matching_engine_cli
@@ -195,12 +221,17 @@ g++ -std=c++17 -O2 -Iinclude src/order_book.cpp src/matching_engine.cpp \
     benchmark/benchmark.cpp -o benchmark_runner
 g++ -std=c++17 -O2 -Iinclude src/order_book.cpp src/matching_engine.cpp \
     src/event_log.cpp src/snapshot.cpp src/wire.cpp src/server.cpp \
-    src/recovery.cpp src/compaction.cpp src/server_main.cpp -o matching_engine_server
+    src/recovery.cpp src/compaction.cpp src/tls.cpp src/server_main.cpp -o matching_engine_server
 
 # Or with CMake, which tracks each target's sources in CMakeLists.txt so this
 # list can't drift the way the commands above can:
 mkdir build && cd build && cmake .. && make
 ```
+
+`src/tls.cpp` always compiles, in both cases above -- see "Encryption on the wire" further down. Without
+OpenSSL on hand, or without passing CMake's `-DWITH_TLS=ON`, it compiles into an inert stub that never
+includes an OpenSSL header at all; `matching_engine_server` still builds and runs exactly as before,
+just without anywhere to turn TLS on.
 
 Run the tests:
 
@@ -495,6 +526,48 @@ earlier.
 are idempotent on purpose, so a client doesn't have to track its own subscription
 state just to avoid an error from restating it.
 
+### Encryption on the wire
+
+Off by default, and off entirely unless this binary was built with it. The plain
+`g++`/CMake commands above never touch OpenSSL at all -- `WITH_TLS` is a CMake option,
+off unless passed:
+
+```bash
+cmake -S . -B build -DWITH_TLS=ON   # needs OpenSSL's headers and libraries on hand
+cmake --build build
+```
+
+A binary built without it still runs; asking it to enable TLS anyway fails clearly
+rather than silently serving plaintext:
+
+```bash
+MATCHING_ENGINE_TLS_CERT=cert.pem MATCHING_ENGINE_TLS_KEY=key.pem ./matching_engine_server 9001
+cannot enable TLS: this binary was not built with TLS support (rebuild with -DWITH_TLS=ON)
+```
+
+With a `WITH_TLS=ON` build, the same two variables turn it on. A self-signed
+certificate is enough for testing against yourself (a real deployment wants one from
+an actual CA, or an internal one, instead):
+
+```bash
+openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 1 -nodes -subj "/CN=localhost"
+
+MATCHING_ENGINE_TLS_CERT=cert.pem MATCHING_ENGINE_TLS_KEY=key.pem ./matching_engine_server 9001 book.log
+listening on 127.0.0.1:9001 (TLS enabled), logging to book.log
+```
+
+From here the wire protocol is identical -- every message in this document, over an
+encrypted connection instead of a plain one. `MATCHING_ENGINE_TLS_CERT` and
+`MATCHING_ENGINE_TLS_KEY` must both be set or both left unset; one without the other
+is refused outright, on the theory that it is almost certainly a typo, not someone
+deliberately configuring half of TLS.
+
+A connection that isn't speaking TLS to a TLS-enabled server (an old client, a
+misconfigured one, or a port scan) fails its handshake and is dropped -- the server
+itself is unaffected, and every other connection keeps working. Nothing about
+authentication, rate limiting, subscriptions, or persistence changes once TLS is on;
+it sits entirely at the transport layer, underneath all of it.
+
 ## Tests and CI
 
 ```bash
@@ -504,15 +577,25 @@ python3 tests/wire_smoke_test.py ./matching_engine_server   # protocol, over a r
 
 CI builds with GCC and Clang on Linux and Clang on macOS, with `-Wpedantic -Werror`,
 and runs the unit tests, the wire integration test, a CLI restart-recovery check, and
-a short benchmark. Two further jobs run everything under AddressSanitizer and
-UndefinedBehaviorSanitizer, and fuzz the wire decoder with libFuzzer. Three toolchains rather than one because that is where a whole
-class of bug lives: a standard-library symbol used without including its header
-compiles fine under whichever implementation you happened to develop against, and
-fails on the other. Adding CI turned up six such cases in this repository.
+a short benchmark. All three build with `WITH_TLS` at its off-by-default setting, the
+same as the plain commands above. Two further jobs run everything under
+AddressSanitizer and UndefinedBehaviorSanitizer, and fuzz the wire decoder with
+libFuzzer -- the sanitizer job builds and tests a `WITH_TLS=ON` pair of binaries too,
+alongside its plain ones. A sixth, dedicated job builds with `-DWITH_TLS=ON` through
+CMake itself rather than the sanitizer job's hand-rolled compiler invocations, so the
+option as an ordinary user would reach for it is what's actually verified there.
+Three toolchains rather than one because that is where a whole class of bug lives: a
+standard-library symbol used without including its header compiles fine under
+whichever implementation you happened to develop against, and fails on the other.
+Adding CI turned up six such cases in this repository.
 
-`tests/fuzz_wire.cpp` targets `FrameReader` and `decodeRequest`, the only code here
-that reads bytes chosen by someone else, since anyone who can open a socket feeds them
-directly. It has two entry points: `LLVMFuzzerTestOneInput` for libFuzzer, and a
+`tests/fuzz_wire.cpp` targets `FrameReader`, `decodeRequest`, `decodeResponse` and
+`decodeMarketData`. `decodeRequest` is the one that matters most: it is the only
+decoder that runs on bytes an attacker actually controls, since anyone who can open a
+socket feeds them straight to it. The other two, in this project's own client/server,
+only ever decode bytes this same codebase just encoded -- fuzzed anyway, since a
+parser's safety shouldn't depend on which side of a connection happens to call it.
+The target has two entry points: `LLVMFuzzerTestOneInput` for libFuzzer, and a
 standalone corpus-replay driver so the harness runs under sanitizers on toolchains
 that ship no libFuzzer runtime (Apple clang does not).
 
@@ -562,6 +645,15 @@ written and installed before the log is ever touched) instead of reusing it.
 
 ## Roadmap
 
-What would come next with more time: encryption on the wire, so the token that
-authentication checks is not sent in plain text over anything but loopback. Every
-other item this section used to list has since been built.
+Every item this section originally listed has since been built. What would come next
+with more time:
+
+1. Mutual TLS: the server already presents a certificate; a client could be required
+   to present one too, as an alternative or a complement to the shared-token
+   authentication that exists today
+2. A handshake timeout. A TLS handshake that never completes occupies a connection
+   slot indefinitely, same as a plain connection that connects and never sends
+   anything already does -- not a new risk TLS introduces, but not one anything
+   times out today either
+3. Reloading a renewed certificate without restarting the process, for a deployment
+   that would rather not schedule downtime around a certificate's expiry

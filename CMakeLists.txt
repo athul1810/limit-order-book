@@ -19,7 +19,19 @@ add_compile_options(-Wall -Wextra -O2)
 
 include_directories(include)
 
-add_library(order_book src/order_book.cpp src/matching_engine.cpp src/event_log.cpp src/snapshot.cpp src/wire.cpp src/server.cpp src/recovery.cpp src/compaction.cpp)
+# Off by default, so the ordinary build stays true to this project's "no
+# external dependencies" baseline (see README). Turning it on links OpenSSL
+# and lets OrderServer::enableTls actually do something -- see tls.hpp for
+# what a binary built without it does instead (fail clearly, not silently).
+option(WITH_TLS "Build with OpenSSL-backed TLS support for the server" OFF)
+
+add_library(order_book src/order_book.cpp src/matching_engine.cpp src/event_log.cpp src/snapshot.cpp src/wire.cpp src/server.cpp src/recovery.cpp src/compaction.cpp src/tls.cpp)
+
+if(WITH_TLS)
+    find_package(OpenSSL REQUIRED)
+    target_compile_definitions(order_book PRIVATE MATCHING_ENGINE_WITH_TLS)
+    target_link_libraries(order_book PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+endif()
 
 add_executable(matching_engine_cli src/main.cpp)
 target_link_libraries(matching_engine_cli order_book)

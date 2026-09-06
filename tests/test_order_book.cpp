@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -13,6 +14,7 @@
 #include "event_log.hpp"
 #include "recovery.hpp"
 #include "snapshot.hpp"
+#include "tls.hpp"
 #include "wire.hpp"
 
 #include "matching_engine.hpp"
@@ -1535,6 +1537,30 @@ void test_matching_engine_levels_forward_to_book_and_are_empty_for_unknown_symbo
     std::cout << "test_matching_engine_levels_forward_to_book_and_are_empty_for_unknown_symbol passed\n";
 }
 
+// ---- TLS (tls.hpp) ----
+//
+// TlsContext/TlsConnection's actual OpenSSL-backed behaviour needs a real
+// socket to exercise meaningfully -- see wire_smoke_test.py's TLS section,
+// which runs a full handshake and wire round trip over one, and only runs
+// at all against a binary actually built with WITH_TLS. What is worth
+// pinning down here, in a way that holds regardless of which way *this*
+// binary happened to be built, is the contract at the boundary: a bad
+// cert/key path always fails, and which reason it fails for tracks
+// tlsSupported() exactly, never the other one.
+void test_tls_context_create_fails_clearly_in_either_build() {
+    std::string error;
+    const std::unique_ptr<TlsContext> context =
+        TlsContext::create("/nonexistent/cert.pem", "/nonexistent/key.pem", error);
+    CHECK(context == nullptr);
+    CHECK(!error.empty());
+    if (tlsSupported()) {
+        CHECK(error.find("not built with TLS support") == std::string::npos);
+    } else {
+        CHECK(error.find("not built with TLS support") != std::string::npos);
+    }
+    std::cout << "test_tls_context_create_fails_clearly_in_either_build passed\n";
+}
+
 // ---- shared recovery (recovery.hpp) ----
 //
 // The CLI and the server used to each carry their own ~50-line copy of
@@ -1916,6 +1942,7 @@ int main() {
     test_order_book_levels_aggregate_by_price_best_first();
     test_order_book_levels_respect_depth_limit();
     test_matching_engine_levels_forward_to_book_and_are_empty_for_unknown_symbol();
+    test_tls_context_create_fails_clearly_in_either_build();
     test_recover_from_nonexistent_log_starts_empty_and_logs_from_zero();
     test_recover_from_existing_log_replays_and_continues_sequence();
     test_recover_from_snapshot_and_log_tail_on_disk();

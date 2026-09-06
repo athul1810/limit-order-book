@@ -49,6 +49,12 @@ OrderServer::~OrderServer() {
     if (listener_ >= 0) ::close(listener_);
 }
 
+bool OrderServer::enableTls(const std::string& cert_path, const std::string& key_path,
+                           std::string& error) {
+    tls_context_ = TlsContext::create(cert_path, key_path, error);
+    return tls_context_ != nullptr;
+}
+
 bool OrderServer::listenOn(std::uint16_t port, std::string& error, const std::string& bind_address) {
     constexpr const char* kLoopback = "127.0.0.1";
 
@@ -147,21 +153,57 @@ void OrderServer::acceptPending() {
                 connection.peer_ip = buf;
             }
         }
+        if (tls_context_ != nullptr) {
+            connection.tls = tls_context_->wrap(fd);
+            // wrap() failing here (it shouldn't, for a context that came
+            // from a successful TlsContext::create()) is treated as "accept
+            // this connection in plaintext" being the wrong fallback --
+            // silently downgrading a TLS-configured server to plaintext for
+            // one unlucky connection is worse than just dropping it.
+            if (connection.tls == nullptr) {
+                ::close(fd);
+                continue;
+            }
+            connection.tls_state = Connection::TlsState::Handshaking;
+        }
         connections_.push_back(std::move(connection));
     }
 }
 
 bool OrderServer::serviceReadable(Connection& connection) {
+    if (connection.tls != nullptr && connection.tls_state == Connection::TlsState::Handshaking) {
+        if (!driveHandshake(connection)) return false;
+        if (connection.tls_state == Connection::TlsState::Handshaking) return true;  // still going
+        // Falls through into the read loop below rather than returning here:
+        // OpenSSL can have already buffered application data read off the
+        // wire while finishing the handshake, which SSL_read can return
+        // right now with no further bytes from the kernel. Waiting for
+        // another POLLIN that might not arrive for a while would stall a
+        // connection that sent its first request in the same flight as its
+        // handshake.
+    }
+
     std::uint8_t chunk[kReadChunkBytes];
 
     while (true) {
-        const ssize_t count = ::read(connection.fd, chunk, sizeof(chunk));
-        if (count == 0) return false;  // peer closed
-        if (count < 0) {
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-            return false;
+        long count;
+        if (connection.tls != nullptr) {
+            TlsWant want = TlsWant::None;
+            count = connection.tls->read(chunk, sizeof(chunk), want);
+            if (count < 0) {
+                connection.tls_want = want;
+                if (want != TlsWant::None) break;  // nothing more right now
+                return false;                      // a real error
+            }
+        } else {
+            count = ::read(connection.fd, chunk, sizeof(chunk));
+            if (count < 0) {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                return false;
+            }
         }
+        if (count == 0) return false;  // peer closed
         connection.reader.append(chunk, static_cast<std::size_t>(count));
         if (static_cast<std::size_t>(count) < sizeof(chunk)) break;
     }
@@ -376,24 +418,63 @@ bool OrderServer::handleResyncMarketData(Connection& connection, const Request& 
 }
 
 bool OrderServer::serviceWritable(Connection& connection) {
+    if (connection.tls != nullptr && connection.tls_state == Connection::TlsState::Handshaking) {
+        if (!driveHandshake(connection)) return false;
+        if (connection.tls_state == Connection::TlsState::Handshaking) return true;  // still going
+        // Falls through for the same reason serviceReadable does: whatever
+        // caused this connection to become established might also have left
+        // it with something already queued to send.
+    }
+
     while (connection.sent < connection.outbox.size()) {
-        const ssize_t count = ::write(connection.fd, connection.outbox.data() + connection.sent,
-                                      connection.outbox.size() - connection.sent);
-        if (count < 0) {
-            if (errno == EINTR) continue;
-            // A partial write is normal, not an error: the kernel buffer is
-            // full and the rest goes out when poll says the socket is writable
-            // again. This is why responses are buffered rather than assumed
-            // sent.
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
-            return false;
+        long count;
+        if (connection.tls != nullptr) {
+            TlsWant want = TlsWant::None;
+            count = connection.tls->write(connection.outbox.data() + connection.sent,
+                                          connection.outbox.size() - connection.sent, want);
+            if (count < 0) {
+                connection.tls_want = want;
+                if (want != TlsWant::None) return true;  // try again once poll says so
+                return false;                            // a real error
+            }
+        } else {
+            count = ::write(connection.fd, connection.outbox.data() + connection.sent,
+                            connection.outbox.size() - connection.sent);
+            if (count < 0) {
+                if (errno == EINTR) continue;
+                // A partial write is normal, not an error: the kernel buffer is
+                // full and the rest goes out when poll says the socket is writable
+                // again. This is why responses are buffered rather than assumed
+                // sent.
+                if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
+                return false;
+            }
         }
         connection.sent += static_cast<std::size_t>(count);
     }
 
     connection.outbox.clear();
     connection.sent = 0;
+    // Fully caught up: whatever earlier wanted a write (this call's own
+    // retries, or a read that reported wanting one -- see the long comment
+    // on Connection::tls_want) no longer does.
+    if (connection.tls != nullptr) connection.tls_want = TlsWant::None;
     return true;
+}
+
+bool OrderServer::driveHandshake(Connection& connection) {
+    switch (connection.tls->handshake()) {
+        case TlsConnection::Status::Again:
+            connection.tls_want = connection.tls->handshakeWant();
+            return true;
+        case TlsConnection::Status::Established:
+            connection.tls_state = Connection::TlsState::Established;
+            connection.tls_want = TlsWant::None;
+            return true;
+        case TlsConnection::Status::Failed:
+            return false;
+    }
+    return false;
 }
 
 void OrderServer::closeConnection(std::size_t index) {
@@ -416,8 +497,13 @@ std::uint64_t OrderServer::runUntilStopped() {
         for (const Connection& connection : connections_) {
             short events = POLLIN;
             // Only ask about writability when there is something to write;
-            // otherwise poll returns immediately, forever.
+            // otherwise poll returns immediately, forever. A pending TLS
+            // want is the other reason to ask: a handshake step (or, rarely,
+            // a post-handshake read or write -- see Connection::tls_want)
+            // can need to send before this connection can make progress at
+            // all, even with nothing of its own queued yet.
             if (connection.sent < connection.outbox.size()) events |= POLLOUT;
+            if (connection.tls_want != TlsWant::None) events |= POLLOUT;
             fds.push_back(pollfd{connection.fd, events, 0});
         }
 

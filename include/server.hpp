@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -12,6 +13,7 @@
 #include <vector>
 
 #include "matching_engine.hpp"
+#include "tls.hpp"
 #include "wire.hpp"
 
 namespace matching_engine {
@@ -113,6 +115,19 @@ class OrderServer {
     // skipped forever.
     void setIdleHook(std::function<void()> hook) { idle_hook_ = std::move(hook); }
 
+    // Enables TLS: every connection accepted from here on is wrapped in a
+    // server-side handshake before any application byte is read from or
+    // written to it. Must be called before listenOn() has accepted anything
+    // (in practice, before it is called at all) -- a connection already
+    // accepted in plaintext cannot be retroactively upgraded.
+    //
+    // False (with `error` set) if the certificate/key can't be loaded, or if
+    // this binary was not built with TLS support at all (CMake's WITH_TLS
+    // option; see tls.hpp's tlsSupported()) -- the two are deliberately
+    // reported the same way, since both mean "TLS is not available", and a
+    // caller's response to either is the same: don't start.
+    bool enableTls(const std::string& cert_path, const std::string& key_path, std::string& error);
+
    private:
     struct Connection {
         int fd = -1;
@@ -131,12 +146,48 @@ class OrderServer {
         // Unsubscribed from. Checked on every broadcastMarketData() call, so
         // membership testing matters more here than insertion order.
         std::unordered_set<Symbol> subscriptions;
+
+        // Null unless this server has TLS enabled, in which case every
+        // connection gets one from acceptPending() onward. `tls_state`
+        // starts Handshaking for a TLS connection (Established, trivially,
+        // for a plaintext one) and `tls_want` records the last direction
+        // OpenSSL asked for -- see TlsWant in tls.hpp -- so runUntilStopped
+        // knows to also poll for writability on a connection with nothing
+        // of its own (yet) queued to send: a raw socket's read always waits
+        // on readability and a write on writability, but a TLS handshake
+        // step, or occasionally even a post-handshake read or write, can
+        // need the opposite direction to make progress. POLLIN itself is
+        // always requested regardless (see runUntilStopped), so the only
+        // thing tls_want actually needs to add is "also ask for POLLOUT".
+        //
+        // One shared field for both directions of I/O rather than two, which
+        // is not perfectly precise: driveHandshake, serviceReadable and
+        // serviceWritable each set it from their own latest OpenSSL result,
+        // and only serviceWritable clears it, once its outbox is fully
+        // drained. A read that reported wanting a write, immediately
+        // followed by a write call that succeeds and clears the flag, could
+        // in principle drop that read's own pending want. This is accepted
+        // rather than tracked separately: it can only matter for a mid-
+        // session renegotiation, which this server never initiates and
+        // TLS 1.3 (the default floor is 1.2, but 1.3 is what any current
+        // client will actually negotiate) does not have in the first place.
+        std::unique_ptr<TlsConnection> tls;
+        enum class TlsState { Handshaking, Established } tls_state = TlsState::Established;
+        TlsWant tls_want = TlsWant::None;
     };
 
     void acceptPending();
     // False if the connection should be closed.
     bool serviceReadable(Connection& connection);
     bool serviceWritable(Connection& connection);
+    // Advances a connection's TLS handshake by one step, from either a
+    // readable or a writable poll event -- either can be the one that moves
+    // it forward, since which direction a given handshake step needs is
+    // OpenSSL's decision, not this server's. Returns false if the
+    // connection should be closed, the same convention as
+    // serviceReadable/serviceWritable, since a failed handshake is as fatal
+    // to a connection as a decode failure is.
+    bool driveHandshake(Connection& connection);
     void closeConnection(std::size_t index);
     // Queues a Response carrying only `reason` (no trades, no unfilled) and
     // counts it toward requests_handled_. Used for the outcomes that never
@@ -185,6 +236,9 @@ class OrderServer {
     MatchingEngine& engine_;
     int listener_ = -1;
     std::uint16_t bound_port_ = 0;
+    // Null unless enableTls() has succeeded. Every connection accepted while
+    // this is set gets wrapped -- see Connection::tls above.
+    std::unique_ptr<TlsContext> tls_context_;
     std::vector<Connection> connections_;
     std::atomic<bool> running_{false};
     std::uint64_t requests_handled_ = 0;

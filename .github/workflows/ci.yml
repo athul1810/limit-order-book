@@ -85,21 +85,40 @@ jobs:
         -fno-omit-frame-pointer -Iinclude
       LIB_SRC: >-
         src/order_book.cpp src/matching_engine.cpp src/event_log.cpp
-        src/snapshot.cpp src/wire.cpp src/recovery.cpp src/compaction.cpp
+        src/snapshot.cpp src/wire.cpp src/recovery.cpp src/compaction.cpp src/tls.cpp
     steps:
       - uses: actions/checkout@v5
+
+      - name: Install OpenSSL development headers
+        # For the WITH_TLS pair below. libssl-dev installs into standard
+        # system paths on Ubuntu, so no extra -I/-L is needed to find it.
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
 
       - name: Build instrumented binaries
         # Explicitly bash: these rely on unquoted word splitting, which bash
         # does and some other shells (zsh) do not.
+        #
+        # Two pairs, not one: tls.cpp compiles into every binary regardless
+        # (see LIB_SRC above), but only behaves like TLS with
+        # -DMATCHING_ENGINE_WITH_TLS and OpenSSL actually linked in -- see
+        # tls.cpp's own two-mode split. Sanitizing both means both of that
+        # file's implementations get checked, not just whichever the plain
+        # build-and-test matrix happens to exercise (WITH_TLS is off there).
         shell: bash
         run: |
           clang++ $SAN_FLAGS $LIB_SRC tests/test_order_book.cpp -o tests_san
           clang++ $SAN_FLAGS $LIB_SRC src/server.cpp src/server_main.cpp -o server_san
           clang++ $SAN_FLAGS -DSTANDALONE_FUZZ_DRIVER $LIB_SRC tests/fuzz_wire.cpp -o fuzz_san
+          clang++ $SAN_FLAGS -DMATCHING_ENGINE_WITH_TLS $LIB_SRC tests/test_order_book.cpp \
+            -lssl -lcrypto -o tests_tls_san
+          clang++ $SAN_FLAGS -DMATCHING_ENGINE_WITH_TLS $LIB_SRC src/server.cpp src/server_main.cpp \
+            -lssl -lcrypto -o server_tls_san
 
       - name: Unit tests
         run: ./tests_san
+
+      - name: Unit tests (TLS build)
+        run: ./tests_tls_san
 
       - name: Wire protocol against an instrumented server
         # The server is where the one memory bug found so far actually lived:
@@ -108,8 +127,47 @@ jobs:
         # and ASan names the line immediately.
         run: python3 tests/wire_smoke_test.py ./server_san
 
+      - name: Wire protocol against an instrumented TLS server
+        # Same script, no special casing needed: it detects TLS support at
+        # runtime and runs its TLS section only when the server it's pointed
+        # at actually has it -- see wire_smoke_test.py's TLS section.
+        run: python3 tests/wire_smoke_test.py ./server_tls_san
+
       - name: Fuzz corpus replay
         run: ./fuzz_san 200000
+
+  tls:
+    name: tls (openssl, WITH_TLS=ON)
+    runs-on: ubuntu-latest
+    # Everything above builds with the default WITH_TLS=OFF (see
+    # CMakeLists.txt) -- true to this project's "no external dependencies"
+    # baseline, and matching what an ordinary `cmake .. && make` gets. This
+    # job is the one place the CMake option itself, not just the sanitizer
+    # job's hand-rolled compiler invocations above, is exercised.
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install OpenSSL development headers
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_CXX_FLAGS="-Wpedantic -Werror" -DWITH_TLS=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Unit tests
+        run: ./build/tests
+
+      - name: Wire protocol integration test, including TLS
+        # wire_smoke_test.py's TLS section generates its own self-signed
+        # test certificate (via the openssl CLI) and runs a real handshake,
+        # a wire round trip over the encrypted connection, and confirms a
+        # plaintext client against this same server gets dropped rather than
+        # accepted or hanging the server.
+        run: python3 tests/wire_smoke_test.py ./build/matching_engine_server
 
   fuzz:
     name: fuzz (libfuzzer)
