@@ -18,7 +18,7 @@ import time
 
 VERSION = 1
 (ADD_SYMBOL, LIMIT, MARKET, MODIFY, CANCEL, RESPONSE, AUTHENTICATE, SUBSCRIBE, UNSUBSCRIBE,
- MARKET_DATA) = 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+ MARKET_DATA, RESYNC_MARKET_DATA) = 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11
 REASONS = {
     0: "ok", 1: "duplicate-id", 2: "unknown-order", 3: "bad-quantity", 4: "unknown-symbol",
     5: "not-authenticated", 6: "authentication-failed", 7: "rate-limited",
@@ -69,6 +69,10 @@ def unsubscribe(corr, s):
     return frame(UNSUBSCRIBE, corr, sym(s))
 
 
+def resync_market_data(corr, s, since_sequence):
+    return frame(RESYNC_MARKET_DATA, corr, sym(s) + struct.pack(">Q", since_sequence))
+
+
 def read_exactly(sock, n):
     buf = b""
     while len(buf) < n:
@@ -111,9 +115,25 @@ def read_market_data(sock):
     (bid_price,) = struct.unpack(">q", body[17:25])
     has_ask = body[25]
     (ask_price,) = struct.unpack(">q", body[26:34])
-    (count,) = struct.unpack(">I", body[34:38])
+    off = 34
+
+    def read_levels():
+        nonlocal off
+        (count,) = struct.unpack(">I", body[off:off + 4])
+        off += 4
+        levels = []
+        for _ in range(count):
+            price, qty = struct.unpack(">qQ", body[off:off + 16])
+            levels.append((price, qty))
+            off += 16
+        return levels
+
+    bid_levels = read_levels()
+    ask_levels = read_levels()
+
+    (count,) = struct.unpack(">I", body[off:off + 4])
+    off += 4
     trades = []
-    off = 38
     for _ in range(count):
         b, s, p, q = struct.unpack(">QQqQ", body[off:off + 32])
         trades.append((b, s, p, q))
@@ -121,7 +141,7 @@ def read_market_data(sock):
     assert off == len(body), "trailing bytes in market data message"
     return {"corr": corr, "symbol": symbol, "sequence": sequence,
             "bid": bid_price if has_bid else None, "ask": ask_price if has_ask else None,
-            "trades": trades}
+            "bid_levels": bid_levels, "ask_levels": ask_levels, "trades": trades}
 
 
 def clean_env(overrides=None):
@@ -134,6 +154,8 @@ def clean_env(overrides=None):
     env.pop("MATCHING_ENGINE_BIND", None)
     env.pop("MATCHING_ENGINE_MAX_AUTH_FAILURES", None)
     env.pop("MATCHING_ENGINE_AUTH_LOCKOUT_SECONDS", None)
+    env.pop("MATCHING_ENGINE_MARKET_DATA_DEPTH", None)
+    env.pop("MATCHING_ENGINE_MARKET_DATA_HISTORY_LIMIT", None)
     if overrides:
         env.update(overrides)
     return env
@@ -383,9 +405,10 @@ def main():
         a.sendall(subscribe(2, "AAPL"))
         snapshot = read_market_data(a)
         check("subscribe snapshot corr", snapshot["corr"], 2)
-        check("subscribe snapshot on an empty book", (snapshot["sequence"], snapshot["bid"],
-                                                       snapshot["ask"], snapshot["trades"]),
-              (0, None, None, []))
+        check("subscribe snapshot on an empty book",
+              (snapshot["sequence"], snapshot["bid"], snapshot["ask"], snapshot["bid_levels"],
+               snapshot["ask_levels"], snapshot["trades"]),
+              (0, None, None, [], [], []))
 
         b = socket.create_connection(("127.0.0.1", md_port), timeout=5)
         b.sendall(limit(3, "AAPL", 100, 1, 10050, 5, 0))  # rest a sell; no trade yet
@@ -393,8 +416,9 @@ def main():
 
         push1 = read_market_data(a)
         check("broadcast is unsolicited (corr 0)", push1["corr"], 0)
-        check("broadcast after a resting order", (push1["sequence"], push1["ask"], push1["trades"]),
-              (1, 10050, []))
+        check("broadcast after a resting order",
+              (push1["sequence"], push1["ask"], push1["ask_levels"], push1["trades"]),
+              (1, 10050, [(10050, 5)], []))
 
         # A crosses the resting sell itself: it gets its own Response, and
         # then, separately, the public broadcast -- both, since it is
@@ -403,8 +427,9 @@ def main():
         own = read_response(a)
         check("A's own trade", own["trades"], [(200, 100, 10050, 3)])
         push2 = read_market_data(a)
-        check("broadcast reflects A's own trade", (push2["sequence"], push2["trades"]),
-              (2, [(200, 100, 10050, 3)]))
+        check("broadcast reflects A's own trade",
+              (push2["sequence"], push2["ask_levels"], push2["trades"]),
+              (2, [(10050, 2)], [(200, 100, 10050, 3)]))
 
         # B, never subscribed, has nothing extra waiting.
         check("unsubscribed connection gets nothing extra", read_after_close_probe(b, timeout=1),
@@ -423,6 +448,91 @@ def main():
 
         a.close()
         b.close()
+    finally:
+        stop_server(proc, out)
+
+    # ---- market data depth ----
+    # Six distinct ask price levels, one more than the server's default
+    # depth of 5 -- checks both that depth is aggregated per price (not per
+    # order) and that a level beyond the configured depth is dropped rather
+    # than silently included.
+    depth_port = free_port()
+    proc, out = start_server(binary, depth_port, os.path.join(workdir, "depth.log"),
+                             os.path.join(workdir, "depth.out"))
+    try:
+        d = socket.create_connection(("127.0.0.1", depth_port), timeout=5)
+        d.sendall(add_symbol(1, "AAPL"))
+        read_response(d)
+        prices = [10000, 10010, 10020, 10030, 10040, 10050]
+        for i, price in enumerate(prices):
+            d.sendall(limit(2 + i, "AAPL", 100 + i, 1, price, 1, 0))
+            check(f"depth setup order {i}", read_response(d)["reason"], "ok")
+
+        d.sendall(subscribe(99, "AAPL"))
+        snap = read_market_data(d)
+        check("depth truncates to the server's configured limit", len(snap["ask_levels"]), 5)
+        check("depth keeps the best five prices, best first", snap["ask_levels"],
+              [(p, 1) for p in prices[:5]])
+        d.close()
+    finally:
+        stop_server(proc, out)
+
+    # ---- market data gap recovery (ResyncMarketData) ----
+    # A short history (2 pushes) so the "gap too wide, fall back to a fresh
+    # snapshot" path is reachable without generating hundreds of events.
+    resync_port = free_port()
+    proc, out = start_server(binary, resync_port, os.path.join(workdir, "resync.log"),
+                             os.path.join(workdir, "resync.out"),
+                             env_overrides={"MATCHING_ENGINE_MARKET_DATA_HISTORY_LIMIT": "2"})
+    try:
+        d = socket.create_connection(("127.0.0.1", resync_port), timeout=5)
+        d.sendall(add_symbol(1, "AAPL"))
+        read_response(d)
+        d.sendall(limit(2, "AAPL", 100, 1, 10050, 5, 0))  # seq 1: rest a sell, no trade
+        read_response(d)
+        d.sendall(limit(3, "AAPL", 200, 0, 10050, 3, 0))  # seq 2: crosses, trades
+        read_response(d)
+        d.sendall(limit(4, "AAPL", 300, 1, 10100, 4, 0))  # seq 3: rests a second level
+        read_response(d)
+        # History now holds sequences 2 and 3 only; 1 has been evicted.
+
+        c = socket.create_connection(("127.0.0.1", resync_port), timeout=5)
+
+        # Within history: replays exactly the missed pushes, each carrying
+        # this request's correlation id rather than the usual unsolicited 0.
+        c.sendall(resync_market_data(50, "AAPL", 1))
+        replay1 = read_market_data(c)
+        replay2 = read_market_data(c)
+        check("resync replays the first missed push", (replay1["corr"], replay1["sequence"],
+                                                        replay1["trades"], replay1["ask_levels"]),
+              (50, 2, [(200, 100, 10050, 3)], [(10050, 2)]))
+        check("resync replays the second missed push", (replay2["corr"], replay2["sequence"],
+                                                        replay2["trades"], replay2["ask_levels"]),
+              (50, 3, [], [(10050, 2), (10100, 4)]))
+
+        # Gap wider than the retained history (asking since sequence 0, but
+        # only 2 and 3 are still buffered): falls back to a single fresh
+        # snapshot, same shape a plain re-subscribe would have produced.
+        c.sendall(resync_market_data(51, "AAPL", 0))
+        fallback = read_market_data(c)
+        check("resync falls back to a snapshot when the gap exceeds history",
+              (fallback["corr"], fallback["sequence"], fallback["trades"]), (51, 3, []))
+
+        # Already caught up (since_sequence == current): also a snapshot,
+        # not zero messages -- so the correlation id still gets a reply.
+        c.sendall(resync_market_data(52, "AAPL", 3))
+        caught_up = read_market_data(c)
+        check("resync when already caught up still replies",
+              (caught_up["corr"], caught_up["sequence"], caught_up["trades"]), (52, 3, []))
+
+        # An unregistered symbol is rejected the same way Subscribe rejects
+        # one, and resync neither requires nor creates a subscription.
+        c.sendall(resync_market_data(53, "NVDA", 0))
+        check("resync to an unregistered symbol is rejected", read_response(c)["reason"],
+              "unknown-symbol")
+
+        d.close()
+        c.close()
     finally:
         stop_server(proc, out)
 

@@ -1,9 +1,13 @@
 // Fuzz target for the wire protocol's parsing path.
 //
-// FrameReader and decodeRequest are the only code here that reads bytes chosen
-// by someone else: anyone who can open a TCP connection to the server feeds
-// them directly. The hand-written tests cover the malformed inputs I thought
-// to imagine, which is exactly the wrong basis for deciding a parser is safe.
+// FrameReader and decodeRequest are the code that matters most here: anyone
+// who can open a TCP connection to the server feeds them bytes directly.
+// decodeResponse and decodeMarketData are, in this project's own
+// client/server, only ever decoding bytes this same codebase just encoded --
+// but every decoder gets the same input regardless, since a parser's safety
+// shouldn't depend on which side of a connection happens to call it. The
+// hand-written tests cover the malformed inputs I thought to imagine, which
+// is exactly the wrong basis for deciding a parser is safe.
 //
 // Two entry points, because Apple clang ships no libFuzzer runtime:
 //   - LLVMFuzzerTestOneInput, used by -fsanitize=fuzzer in CI.
@@ -64,6 +68,16 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
         // any message type in either direction.
         Response as_response;
         decodeResponse(correlation_id, payload.data(), payload.size(), as_response);
+
+        // And as a MarketData message. Never sent by a client to the server
+        // in this project's own client/server, but decodeMarketData is the
+        // one decoder here with several variable-length sections read back
+        // to back (bid levels, ask levels, trades), each depending on a
+        // count read from the bytes before it -- exactly the shape of parser
+        // most likely to hide an off-by-one, and worth fuzzing regardless of
+        // which side of a connection would actually call it.
+        MarketDataMessage as_market_data;
+        decodeMarketData(correlation_id, payload.data(), payload.size(), as_market_data);
     }
 
     return 0;

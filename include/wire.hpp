@@ -75,6 +75,20 @@ enum class MessageType : std::uint8_t {
     // MarketOrder, ModifyOrder or CancelOrder that touched a symbol this
     // connection is subscribed to. See MarketDataMessage below.
     MarketData = 10,
+    // Client -> server: "catch me up on `symbol` since `since_sequence`,
+    // without going through a fresh Subscribe." Payload is the symbol plus
+    // an 8-byte since_sequence (see Request::since_sequence). Rejected with
+    // a Response{UnknownSymbol} exactly like Subscribe; otherwise answered
+    // with one MarketData message per event the server can still supply
+    // starting at since_sequence + 1, each carrying this request's
+    // correlation id -- or, if that much history is no longer retained (or
+    // since_sequence is already caught up), a single MarketData snapshot
+    // shaped exactly like a fresh Subscribe's, so a client that can't be
+    // caught up incrementally still ends up in a known state. Independent of
+    // subscription state: it neither requires nor creates a Subscribe, since
+    // its entire purpose is recovering from a gap in a subscription a client
+    // already has.
+    ResyncMarketData = 11,
 };
 
 // One decoded client request. Fields not used by a given message type are left
@@ -90,6 +104,10 @@ struct Request {
     Quantity quantity = 0;
     ParticipantId participant = kNoParticipant;
     std::string token;  // Authenticate only: the raw credential, no encoding
+    // ResyncMarketData only: the last sequence this client is known to have
+    // for `symbol`. 0 means "I have nothing yet", the same starting point a
+    // fresh Subscribe implies.
+    std::uint64_t since_sequence = 0;
 };
 
 struct Response {
@@ -112,12 +130,22 @@ struct Response {
 // `best_bid`/`best_ask` mirror MatchingEngine::bestBid/bestAsk's own
 // std::optional: unset means an empty side, not a sentinel price to
 // misinterpret as real.
+//
+// `bid_levels`/`ask_levels` are aggregated depth, best price first, out to
+// whatever depth the server is configured to publish (see OrderServer) --
+// not necessarily the whole book. best_bid/best_ask are redundant with
+// bid_levels[0]/ask_levels[0] when depth is at least 1, kept as their own
+// fields rather than removed so a client that only ever wants top-of-book
+// doesn't have to unpack an array to get it, and so an empty-book message
+// (no levels at all) still has an unambiguous "empty" to check.
 struct MarketDataMessage {
     std::uint32_t correlation_id = 0;  // 0 on an unsolicited push; nothing requested it
     Symbol symbol;
     std::uint64_t sequence = 0;
     std::optional<Price> best_bid;
     std::optional<Price> best_ask;
+    std::vector<PriceLevel> bid_levels;
+    std::vector<PriceLevel> ask_levels;
     std::vector<Trade> trades;  // empty on a Subscribe snapshot; may be empty on a push too
 };
 

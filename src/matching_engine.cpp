@@ -93,6 +93,16 @@ std::optional<Price> MatchingEngine::bestAsk(const Symbol& symbol) const {
     return (book == nullptr) ? std::nullopt : book->bestAsk();
 }
 
+std::vector<PriceLevel> MatchingEngine::bidLevels(const Symbol& symbol, std::size_t depth) const {
+    const OrderBook* book = findBook(symbol);
+    return (book == nullptr) ? std::vector<PriceLevel>{} : book->bidLevels(depth);
+}
+
+std::vector<PriceLevel> MatchingEngine::askLevels(const Symbol& symbol, std::size_t depth) const {
+    const OrderBook* book = findBook(symbol);
+    return (book == nullptr) ? std::vector<PriceLevel>{} : book->askLevels(depth);
+}
+
 std::size_t MatchingEngine::restingOrderCount(const Symbol& symbol) const {
     const OrderBook* book = findBook(symbol);
     return (book == nullptr) ? 0 : book->restingOrderCount();

@@ -86,6 +86,15 @@ struct SubmitResult {
     bool accepted() const { return reason == RejectReason::None; }
 };
 
+// One level of aggregated book depth: every resting order at `price`,
+// summed into a single `quantity`. This is "market by price" (what most
+// venues call a depth feed), as opposed to restingOrders() below, which is
+// "market by order" -- every individual order, not aggregated at all.
+struct PriceLevel {
+    Price price;
+    Quantity quantity;
+};
+
 // A single-instrument limit order book with price-time priority matching.
 //
 // Bids are kept highest-price-first, asks lowest-price-first. Within a
@@ -157,6 +166,14 @@ class OrderBook {
 
     std::optional<Price> bestBid() const;
     std::optional<Price> bestAsk() const;
+
+    // Up to `depth` aggregated price levels per side, best price first --
+    // depth() == 0 means every level, not zero of them, since "give me
+    // nothing" has no caller and would make 0 a silent footgun default.
+    // Allocates, like restingOrders() below, so this is a cold-path API too:
+    // a market data push building a depth snapshot, not the order-entry path.
+    std::vector<PriceLevel> bidLevels(std::size_t depth = 0) const;
+    std::vector<PriceLevel> askLevels(std::size_t depth = 0) const;
 
     // Number of resting orders across both sides. Handy for tests/benchmarks.
     std::size_t restingOrderCount() const { return locations_.size(); }

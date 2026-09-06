@@ -85,6 +85,11 @@ class MatchingEngine {
     std::optional<Price> bestBid(const Symbol& symbol) const;
     std::optional<Price> bestAsk(const Symbol& symbol) const;
 
+    // Empty for an unknown symbol, exactly as for an empty book side. See
+    // OrderBook::bidLevels/askLevels for what `depth` means.
+    std::vector<PriceLevel> bidLevels(const Symbol& symbol, std::size_t depth = 0) const;
+    std::vector<PriceLevel> askLevels(const Symbol& symbol, std::size_t depth = 0) const;
+
     // Resting orders in one book (0 if unknown), or summed across every book.
     std::size_t restingOrderCount(const Symbol& symbol) const;
     std::size_t restingOrderCount() const;

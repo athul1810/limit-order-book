@@ -43,8 +43,9 @@ interview, not a black box.
   until one is set. A source that fails too many attempts in a row is locked out for
   a cooldown period, tracked per source address rather than per connection.
 - **Market data**: subscribe to a symbol over the same connection and get a snapshot
-  of its current best bid/ask, then a push after every subsequent trade or resting
-  order that touches it, with a sequence number for detecting a missed one.
+  of its current best bid/ask and depth, then a push after every subsequent trade or
+  resting order that touches it, with a sequence number for detecting a missed one
+  and a way to recover from a gap without having to re-subscribe.
 
 ## Design
 
@@ -169,11 +170,6 @@ This is a matching core, not a trading system. Missing on purpose, not by oversi
   is and a routable network generally is not. Encrypting the connection itself (TLS,
   most plausibly) is a separate piece of work from checking a credential once it
   arrives, and is still missing
-- Depth of book. A market data push carries only the best bid and best ask, not the
-  levels behind them; a subscriber sees that the top of the book moved, not why
-- Recovering a missed market data message other than by re-subscribing. There is no
-  way to ask for "everything since sequence N" -- a gap means re-subscribing for a
-  fresh snapshot and picking the sequence back up from there
 - Windows. The server uses POSIX sockets and `poll()`
 - Concurrency: the book is single-threaded by design; a real engine gets its
   concurrency at the I/O boundary, not inside the matching core itself. Per-symbol
@@ -432,8 +428,9 @@ Any connection can subscribe to a symbol's public book state, in addition to
 whatever orders it is submitting on the same connection:
 
 ```
-Subscribe "AAPL"  -> a MarketData snapshot: current best bid/ask, sequence 0,
-                     no trades (a snapshot isn't itself an event)
+Subscribe "AAPL"  -> a MarketData snapshot: current best bid/ask, up to five
+                     aggregated price levels per side, sequence 0, no trades
+                     (a snapshot isn't itself an event)
 ```
 
 From then on, that connection gets an unsolicited `MarketData` push after every
@@ -442,8 +439,8 @@ connection, itself included:
 
 ```
 someone submits an order on AAPL
-  -> MarketData: new best bid/ask, sequence 1, and the trades that just happened
-     (empty if the order simply rested without crossing anything)
+  -> MarketData: new best bid/ask, new depth, sequence 1, and the trades that
+     just happened (empty if the order simply rested without crossing anything)
 ```
 
 The push and a connection's own `Response` to its own order are two separate
@@ -451,22 +448,47 @@ messages, sent to a subscribed, acting connection in that order: `Response` says
 happened to *your* order, `MarketData` says what the book's public state now is.
 Everyone subscribed gets the second one, including whoever caused it.
 
+Depth is aggregated by price, not by order: three resting orders at the same price
+are one level with their quantities summed, exactly what a real depth feed calls
+"market by price" rather than "market by order" (`restingOrders()`, used for
+snapshotting, is the latter). Five levels per side by default, configurable with
+`MATCHING_ENGINE_MARKET_DATA_DEPTH`; a deep book multiplied by every subscribed
+connection is real bandwidth, so the default stays small rather than sending the
+whole book on every push.
+
 `sequence` is what a gap looks like: a snapshot reports what has already happened, so
 the very next push should be exactly one more, and every push after that one more
-again. If a push ever arrives out of that order, something was missed, and the fix is
-to `Subscribe` again for a fresh snapshot rather than trust what has been received so
-far. There is no way to ask for "replay everything since sequence N" -- resubscribing
-is the only recovery path.
+again. If a push ever arrives out of that order, something was missed. The fix is
+`ResyncMarketData "AAPL" since_sequence`, sent on any connection regardless of whether
+it is itself subscribed:
 
-Two design choices worth stating plainly. First, the trigger for a push is simple on
-purpose: any of those four request types succeeding, whether or not it happened to
-move the best price or produce a trade. An unfilled market order against an empty
-book still triggers a push (an unchanged bid/ask, no trades) rather than the server
-trying to detect "did anything actually change," which would be a second condition to
-get right for very little benefit. Second, subscribing requires the symbol to already
-exist -- `Subscribe` to one that doesn't is rejected the same way trading on it would
-be -- so a brand-new `SYMBOL`/`AddSymbol` never itself needs to push anything: nothing
-could be subscribed to a symbol that did not exist a moment earlier.
+```
+ResyncMarketData "AAPL" 5
+  -> if the server still has sequences 6 onward: exactly those MarketData
+     messages, in order, each carrying this request's correlation id (a live,
+     unsolicited push always carries 0, so the two are never ambiguous even if
+     they land back to back)
+  -> otherwise (the gap is wider than the server's retained history, or there
+     was nothing to miss): one MarketData snapshot, shaped exactly like a
+     fresh Subscribe's -- the same outcome resubscribing would have produced,
+     without having to also touch this connection's actual subscription
+```
+
+The server keeps the last `MATCHING_ENGINE_MARKET_DATA_HISTORY_LIMIT` pushes per
+symbol (200 by default) to answer this from; older ones are simply forgotten, a
+bound on memory rather than a durability guarantee. `ResyncMarketData` to an
+unregistered symbol is rejected the same way `Subscribe` is.
+
+Two further design choices worth stating plainly. First, the trigger for a push is
+simple on purpose: any of those four request types succeeding, whether or not it
+happened to move the best price or produce a trade. An unfilled market order against
+an empty book still triggers a push (an unchanged bid/ask, no trades) rather than the
+server trying to detect "did anything actually change," which would be a second
+condition to get right for very little benefit. Second, subscribing requires the
+symbol to already exist -- `Subscribe` to one that doesn't is rejected the same way
+trading on it would be -- so a brand-new `SYMBOL`/`AddSymbol` never itself needs to
+push anything: nothing could be subscribed to a symbol that did not exist a moment
+earlier.
 
 `Unsubscribe` always succeeds, including when not currently subscribed, the same as
 `Subscribe` succeeding again while already subscribed just resends the snapshot. Both
@@ -540,10 +562,6 @@ written and installed before the log is ever touched) instead of reusing it.
 
 ## Roadmap
 
-What would come next with more time:
-
-1. Encryption on the wire, so the token that authentication checks is not sent in
-   plain text over anything but loopback
-2. Depth of book in a market data push, not just the best bid and ask
-3. A way to recover a missed market data message other than re-subscribing from
-   scratch
+What would come next with more time: encryption on the wire, so the token that
+authentication checks is not sent in plain text over anything but loopback. Every
+other item this section used to list has since been built.

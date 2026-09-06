@@ -76,6 +76,26 @@ int main(int argc, char** argv) {
         if (parsed > 0) auth_lockout_duration = std::chrono::seconds(parsed);
     }
 
+    // How many aggregated price levels per side every MarketData message
+    // carries. 0 would mean "the whole book" (see OrderBook::bidLevels), not
+    // used as this default for exactly that reason: an unbounded depth times
+    // every subscribed connection is an unbounded push size.
+    std::size_t market_data_depth = OrderServer::kDefaultMarketDataDepth;
+    if (const char* depth_env = std::getenv("MATCHING_ENGINE_MARKET_DATA_DEPTH");
+        depth_env != nullptr && *depth_env != '\0') {
+        const long parsed = std::atol(depth_env);
+        if (parsed > 0) market_data_depth = static_cast<std::size_t>(parsed);
+    }
+
+    // How many past MarketData pushes per symbol ResyncMarketData can still
+    // hand back verbatim before falling back to a fresh snapshot.
+    std::size_t market_data_history_limit = OrderServer::kDefaultMarketDataHistoryLimit;
+    if (const char* history_env = std::getenv("MATCHING_ENGINE_MARKET_DATA_HISTORY_LIMIT");
+        history_env != nullptr && *history_env != '\0') {
+        const long parsed = std::atol(history_env);
+        if (parsed > 0) market_data_history_limit = static_cast<std::size_t>(parsed);
+    }
+
     MatchingEngine engine;
 
     // Same recovery path as the CLI -- see recovery.hpp. A server that
@@ -103,7 +123,8 @@ int main(int argc, char** argv) {
         log = std::move(recovered.log);
     }
 
-    OrderServer server(engine, required_token, max_auth_failures, auth_lockout_duration);
+    OrderServer server(engine, required_token, max_auth_failures, auth_lockout_duration, market_data_depth,
+                       market_data_history_limit);
 
     // Unlike the CLI, the server has a genuine idle tick (the poll loop's
     // own timeout) independent of request traffic, so a wall-clock trigger

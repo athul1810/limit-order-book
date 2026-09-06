@@ -240,4 +240,28 @@ std::optional<Price> OrderBook::bestAsk() const {
     return asks_.begin()->first;
 }
 
+namespace {
+
+template <typename PriceMap>
+std::vector<PriceLevel> aggregateLevels(const PriceMap& side, std::size_t depth) {
+    std::vector<PriceLevel> levels;
+    for (const auto& [price, orders] : side) {
+        if (depth != 0 && levels.size() >= depth) break;
+        Quantity total = 0;
+        for (const Order& order : orders) total += order.quantity;
+        levels.push_back(PriceLevel{price, total});
+    }
+    return levels;
+}
+
+}  // namespace
+
+std::vector<PriceLevel> OrderBook::bidLevels(std::size_t depth) const {
+    return aggregateLevels(bids_, depth);
+}
+
+std::vector<PriceLevel> OrderBook::askLevels(std::size_t depth) const {
+    return aggregateLevels(asks_, depth);
+}
+
 }  // namespace matching_engine

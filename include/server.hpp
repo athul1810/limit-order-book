@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <optional>
 #include <string>
@@ -51,14 +52,33 @@ class OrderServer {
     static constexpr std::chrono::steady_clock::duration kDefaultAuthLockoutDuration =
         std::chrono::seconds(30);
 
+    // `market_data_depth` bounds how many aggregated price levels per side
+    // go into every MarketData message (snapshot, push, or resync reply) --
+    // see OrderBook::bidLevels/askLevels for what the number means. Kept
+    // small by default because a deep book multiplied by every subscribed
+    // connection is exactly the cost this bounds.
+    //
+    // `market_data_history_limit` bounds how many past pushes per symbol
+    // ResyncMarketData can still hand back verbatim (see broadcastMarketData
+    // and market_data_history_ below) -- how far back a gap can be closed
+    // before falling back to a fresh snapshot, the same outcome resubscribing
+    // would have produced anyway. Older entries are simply forgotten, not
+    // persisted, so this is a bound on memory, not a durability guarantee.
+    static constexpr std::size_t kDefaultMarketDataDepth = 5;
+    static constexpr std::size_t kDefaultMarketDataHistoryLimit = 200;
+
     explicit OrderServer(MatchingEngine& engine, std::optional<std::string> required_token = std::nullopt,
                          std::uint32_t max_auth_failures = kDefaultMaxAuthFailures,
                          std::chrono::steady_clock::duration auth_lockout_duration =
-                             kDefaultAuthLockoutDuration)
+                             kDefaultAuthLockoutDuration,
+                         std::size_t market_data_depth = kDefaultMarketDataDepth,
+                         std::size_t market_data_history_limit = kDefaultMarketDataHistoryLimit)
         : engine_(engine),
           required_token_(std::move(required_token)),
           max_auth_failures_(max_auth_failures),
-          auth_lockout_duration_(auth_lockout_duration) {}
+          auth_lockout_duration_(auth_lockout_duration),
+          market_data_depth_(market_data_depth),
+          market_data_history_limit_(market_data_history_limit) {}
     ~OrderServer();
 
     OrderServer(const OrderServer&) = delete;
@@ -133,6 +153,21 @@ class OrderServer {
     // empty book, say) in exchange for not having to detect "did the book
     // actually visibly change" as a second, easy-to-get-wrong condition.
     void broadcastMarketData(const Symbol& symbol, const std::vector<Trade>& trades);
+    // Builds the "current state, no events" message both a Subscribe and a
+    // ResyncMarketData that can't be satisfied from history send back:
+    // current best bid/ask and depth, `sequence` at whatever it already is
+    // (not incremented -- a snapshot reports what already happened, it isn't
+    // itself an event), empty trades, and `correlation_id` echoing whichever
+    // request asked for it.
+    MarketDataMessage buildSnapshot(const Symbol& symbol, std::uint32_t correlation_id) const;
+    // Handles ResyncMarketData: replays buffered pushes after
+    // request.since_sequence if market_data_history_ for the symbol still
+    // covers that far back, otherwise falls back to buildSnapshot(). Returns
+    // false if the connection should be closed (mirrors serviceReadable's
+    // own convention), which in practice never happens here -- kept as a
+    // bool anyway so this reads the same as every other request handler
+    // serviceReadable calls out to.
+    bool handleResyncMarketData(Connection& connection, const Request& request);
 
     // Rate-limiting state for one source: how many Authenticate attempts it
     // has failed in a row since its last success (or since the last time a
@@ -161,10 +196,18 @@ class OrderServer {
     // entry means "no recent failures", the common case, so a source that has
     // never gotten anything wrong never occupies a slot here.
     std::unordered_map<std::string, AuthFailureState> auth_failures_;
+    std::size_t market_data_depth_;
+    std::size_t market_data_history_limit_;
     // The sequence of the LAST MarketData broadcast for each symbol (0 if
     // none yet) -- see MarketDataMessage in wire.hpp for the exact contract
     // this is the server-side half of.
     std::unordered_map<Symbol, std::uint64_t> market_data_sequence_;
+    // The last market_data_history_limit_ pushes broadcastMarketData() has
+    // sent for each symbol, oldest first -- what ResyncMarketData replays
+    // from. A symbol with no entry here (or one whose front is already past
+    // the requested since_sequence) can't be replayed and falls back to
+    // buildSnapshot() instead.
+    std::unordered_map<Symbol, std::deque<MarketDataMessage>> market_data_history_;
 };
 
 }  // namespace matching_engine

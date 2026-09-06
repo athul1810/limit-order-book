@@ -1360,6 +1360,8 @@ void test_market_data_round_trips_bid_ask_and_trades() {
     message.sequence = 42;
     message.best_bid = 100'50;
     message.best_ask = 101'00;
+    message.bid_levels = {PriceLevel{100'50, 7}, PriceLevel{100'25, 3}};
+    message.ask_levels = {PriceLevel{101'00, 4}};
     message.trades = {Trade{1, 2, 100'75, 5, 0}, Trade{3, 4, 100'80, 2, 0}};
 
     std::vector<std::uint8_t> bytes;
@@ -1380,6 +1382,11 @@ void test_market_data_round_trips_bid_ask_and_trades() {
     CHECK(decoded.sequence == 42);
     CHECK(decoded.best_bid.has_value() && *decoded.best_bid == 100'50);
     CHECK(decoded.best_ask.has_value() && *decoded.best_ask == 101'00);
+    CHECK(decoded.bid_levels.size() == 2);
+    CHECK(decoded.bid_levels[0].price == 100'50 && decoded.bid_levels[0].quantity == 7);
+    CHECK(decoded.bid_levels[1].price == 100'25 && decoded.bid_levels[1].quantity == 3);
+    CHECK(decoded.ask_levels.size() == 1);
+    CHECK(decoded.ask_levels[0].price == 101'00 && decoded.ask_levels[0].quantity == 4);
     CHECK(decoded.trades.size() == 2);
     CHECK(decoded.trades[0].price == 100'75 && decoded.trades[0].quantity == 5);
     CHECK(decoded.trades[1].price == 100'80 && decoded.trades[1].quantity == 2);
@@ -1409,6 +1416,8 @@ void test_market_data_round_trips_an_empty_book() {
     CHECK(decodeMarketData(correlation_id, payload.data(), payload.size(), decoded));
     CHECK(!decoded.best_bid.has_value());
     CHECK(!decoded.best_ask.has_value());
+    CHECK(decoded.bid_levels.empty());
+    CHECK(decoded.ask_levels.empty());
     CHECK(decoded.trades.empty());
     CHECK(decoded.sequence == 0);
     std::cout << "test_market_data_round_trips_an_empty_book passed\n";
@@ -1431,13 +1440,99 @@ void test_decode_request_rejects_market_data_as_a_client_request() {
 // branches do.
 void test_apply_request_does_not_understand_subscription_types() {
     MatchingEngine engine;
-    for (MessageType type : {MessageType::Subscribe, MessageType::Unsubscribe, MessageType::MarketData}) {
+    for (MessageType type : {MessageType::Subscribe, MessageType::Unsubscribe, MessageType::MarketData,
+                             MessageType::ResyncMarketData}) {
         Request request;
         request.type = type;
         request.symbol = "AAPL";
         CHECK(applyRequest(request, engine).reason != RejectReason::None);
     }
     std::cout << "test_apply_request_does_not_understand_subscription_types passed\n";
+}
+
+// ---- market data gap recovery (wire.hpp's MessageType::ResyncMarketData) ----
+
+void test_resync_market_data_round_trips_symbol_and_since_sequence() {
+    Request request;
+    request.type = MessageType::ResyncMarketData;
+    request.correlation_id = 17;
+    request.symbol = "AAPL";
+    request.since_sequence = 12345;
+
+    std::vector<std::uint8_t> bytes;
+    CHECK(encodeRequest(request, bytes));
+
+    FrameReader reader;
+    reader.append(bytes.data(), bytes.size());
+    MessageType type;
+    std::uint32_t correlation_id = 0;
+    std::vector<std::uint8_t> payload;
+    CHECK(reader.next(type, correlation_id, payload));
+    CHECK(type == MessageType::ResyncMarketData);
+
+    Request decoded;
+    CHECK(decodeRequest(type, correlation_id, payload.data(), payload.size(), decoded));
+    CHECK(decoded.correlation_id == 17);
+    CHECK(decoded.symbol == "AAPL");
+    CHECK(decoded.since_sequence == 12345);
+    std::cout << "test_resync_market_data_round_trips_symbol_and_since_sequence passed\n";
+}
+
+void test_resync_market_data_rejects_wrong_length() {
+    Request out;
+    const std::uint8_t too_short[kSymbolBytes] = {'A', 'A', 'P', 'L', 0, 0, 0, 0};
+    CHECK(!decodeRequest(MessageType::ResyncMarketData, 1, too_short, sizeof(too_short), out));
+    std::cout << "test_resync_market_data_rejects_wrong_length passed\n";
+}
+
+// ---- market data depth (order_book.hpp's PriceLevel, OrderBook/MatchingEngine::bidLevels/askLevels) ----
+
+void test_order_book_levels_aggregate_by_price_best_first() {
+    OrderBook book;
+    book.addLimitOrder(1, Side::Buy, 100'00, 5, kAlice);
+    book.addLimitOrder(2, Side::Buy, 100'00, 3, kBob);  // same price as 1: one aggregated level
+    book.addLimitOrder(3, Side::Buy, 99'50, 10, kAlice);
+    book.addLimitOrder(4, Side::Sell, 101'00, 4, kAlice);
+
+    const std::vector<PriceLevel> bids = book.bidLevels();
+    CHECK(bids.size() == 2);
+    CHECK(bids[0].price == 100'00 && bids[0].quantity == 8);  // 5 + 3, best bid first
+    CHECK(bids[1].price == 99'50 && bids[1].quantity == 10);
+
+    const std::vector<PriceLevel> asks = book.askLevels();
+    CHECK(asks.size() == 1);
+    CHECK(asks[0].price == 101'00 && asks[0].quantity == 4);
+    std::cout << "test_order_book_levels_aggregate_by_price_best_first passed\n";
+}
+
+void test_order_book_levels_respect_depth_limit() {
+    OrderBook book;
+    for (int i = 0; i < 6; ++i) {
+        book.addLimitOrder(static_cast<OrderId>(i), Side::Sell, 100'00 + i * 10, 1, kAlice);
+    }
+    const std::vector<PriceLevel> capped = book.askLevels(5);
+    CHECK(capped.size() == 5);
+    CHECK(capped.front().price == 100'00);  // best (lowest ask) first
+    CHECK(capped.back().price == 100'40);   // the sixth level (100'50) is cut off
+
+    const std::vector<PriceLevel> uncapped = book.askLevels();  // depth 0 == everything
+    CHECK(uncapped.size() == 6);
+    std::cout << "test_order_book_levels_respect_depth_limit passed\n";
+}
+
+void test_matching_engine_levels_forward_to_book_and_are_empty_for_unknown_symbol() {
+    MatchingEngine engine;
+    engine.addSymbol("AAPL");
+    engine.addLimitOrder("AAPL", 1, Side::Buy, 100'00, 5, kAlice);
+    engine.addLimitOrder("AAPL", 2, Side::Sell, 101'00, 3, kAlice);
+
+    const std::vector<PriceLevel> bids = engine.bidLevels("AAPL");
+    CHECK(bids.size() == 1 && bids[0].price == 100'00 && bids[0].quantity == 5);
+    const std::vector<PriceLevel> asks = engine.askLevels("AAPL");
+    CHECK(asks.size() == 1 && asks[0].price == 101'00 && asks[0].quantity == 3);
+    CHECK(engine.bidLevels("MSFT").empty());  // unregistered symbol: empty, not an error
+    CHECK(engine.askLevels("MSFT").empty());
+    std::cout << "test_matching_engine_levels_forward_to_book_and_are_empty_for_unknown_symbol passed\n";
 }
 
 // ---- shared recovery (recovery.hpp) ----
@@ -1816,6 +1911,11 @@ int main() {
     test_market_data_round_trips_an_empty_book();
     test_decode_request_rejects_market_data_as_a_client_request();
     test_apply_request_does_not_understand_subscription_types();
+    test_resync_market_data_round_trips_symbol_and_since_sequence();
+    test_resync_market_data_rejects_wrong_length();
+    test_order_book_levels_aggregate_by_price_best_first();
+    test_order_book_levels_respect_depth_limit();
+    test_matching_engine_levels_forward_to_book_and_are_empty_for_unknown_symbol();
     test_recover_from_nonexistent_log_starts_empty_and_logs_from_zero();
     test_recover_from_existing_log_replays_and_continues_sequence();
     test_recover_from_snapshot_and_log_tail_on_disk();

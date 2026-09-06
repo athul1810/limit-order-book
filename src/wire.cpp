@@ -87,10 +87,17 @@ constexpr std::size_t kCancelOrderBytes = kSymbolBytes + 8;
 // AddSymbol.
 constexpr std::size_t kSubscribeBytes = kSymbolBytes;
 constexpr std::size_t kUnsubscribeBytes = kSymbolBytes;
+// ResyncMarketData is a symbol plus the one field Subscribe doesn't need.
+constexpr std::size_t kResyncMarketDataBytes = kSymbolBytes + 8;
 constexpr std::size_t kResponseFixedBytes = 1 + 1 + 4 + 8;
 constexpr std::size_t kTradeBytes = 8 + 8 + 8 + 8;
-// symbol + sequence + has_bid + bid_price + has_ask + ask_price + trade_count
-constexpr std::size_t kMarketDataFixedBytes = kSymbolBytes + 8 + 1 + 8 + 1 + 8 + 4;
+constexpr std::size_t kPriceLevelBytes = 8 + 8;
+// symbol + sequence + has_bid + bid_price + has_ask + ask_price. Only the
+// part before the first variable-length section (bid levels, ask levels,
+// then trades, each its own u32 count followed by that many entries) --
+// decodeMarketData walks those sequentially rather than folding them into
+// one constant, since each one's length depends on a count read at runtime.
+constexpr std::size_t kMarketDataFixedBytes = kSymbolBytes + 8 + 1 + 8 + 1 + 8;
 
 bool sideFromByte(std::uint8_t value, Side& out) {
     if (value == 0) {
@@ -160,6 +167,9 @@ bool encodeRequest(const Request& request, std::vector<std::uint8_t>& out) {
         case MessageType::Unsubscribe:
             // All three are just a symbol, and putSymbol() above already
             // wrote it.
+            break;
+        case MessageType::ResyncMarketData:
+            putU64(out, request.since_sequence);
             break;
         case MessageType::LimitOrder:
             putU64(out, request.order_id);
@@ -278,6 +288,11 @@ bool decodeRequest(MessageType type, std::uint32_t correlation_id, const std::ui
             if (length != kUnsubscribeBytes) return false;
             out.symbol = getSymbol(payload);
             return !out.symbol.empty();
+        case MessageType::ResyncMarketData:
+            if (length != kResyncMarketDataBytes) return false;
+            out.symbol = getSymbol(payload);
+            out.since_sequence = getU64(payload + kSymbolBytes);
+            return !out.symbol.empty();
         case MessageType::Response:
         case MessageType::MarketData:
             return false;  // server -> client only, never a client request
@@ -325,6 +340,16 @@ bool encodeMarketData(const MarketDataMessage& message, std::vector<std::uint8_t
     putI64(out, message.best_bid.value_or(0));
     putU8(out, message.best_ask.has_value() ? 1 : 0);
     putI64(out, message.best_ask.value_or(0));
+    putU32(out, static_cast<std::uint32_t>(message.bid_levels.size()));
+    for (const PriceLevel& level : message.bid_levels) {
+        putI64(out, level.price);
+        putU64(out, level.quantity);
+    }
+    putU32(out, static_cast<std::uint32_t>(message.ask_levels.size()));
+    for (const PriceLevel& level : message.ask_levels) {
+        putI64(out, level.price);
+        putU64(out, level.quantity);
+    }
     putU32(out, static_cast<std::uint32_t>(message.trades.size()));
     for (const Trade& trade : message.trades) {
         putU64(out, trade.buy_order_id);
@@ -355,12 +380,40 @@ bool decodeMarketData(std::uint32_t correlation_id, const std::uint8_t* payload,
     const Price ask_price = getI64(payload + 26);
     if (has_ask) out.best_ask = ask_price;
 
-    const std::uint32_t trade_count = getU32(payload + 34);
-    if (length != kMarketDataFixedBytes + static_cast<std::size_t>(trade_count) * kTradeBytes) {
-        return false;
-    }
+    // Three variable-length sections follow in a row (bid levels, ask
+    // levels, trades), each its own u32 count then that many entries. Each
+    // one's count is checked against the bytes actually available before
+    // reserving or looping, the same way the single trade array below
+    // always has been -- so a bogus huge count fails cleanly here rather
+    // than driving a multi-gigabyte reserve() off an attacker-chosen number
+    // that the final length check would have rejected anyway.
+    std::size_t offset = kMarketDataFixedBytes;
+
+    auto readLevels = [&](std::vector<PriceLevel>& out_levels) -> bool {
+        if (length < offset + 4) return false;
+        const std::uint32_t count = getU32(payload + offset);
+        offset += 4;
+        if (count > (length - offset) / kPriceLevelBytes) return false;
+        out_levels.reserve(count);
+        for (std::uint32_t i = 0; i < count; ++i) {
+            PriceLevel level{};
+            level.price = getI64(payload + offset);
+            level.quantity = getU64(payload + offset + 8);
+            out_levels.push_back(level);
+            offset += kPriceLevelBytes;
+        }
+        return true;
+    };
+
+    if (!readLevels(out.bid_levels)) return false;
+    if (!readLevels(out.ask_levels)) return false;
+
+    if (length < offset + 4) return false;
+    const std::uint32_t trade_count = getU32(payload + offset);
+    offset += 4;
+    if (length != offset + static_cast<std::size_t>(trade_count) * kTradeBytes) return false;
     out.trades.reserve(trade_count);
-    const std::uint8_t* p = payload + kMarketDataFixedBytes;
+    const std::uint8_t* p = payload + offset;
     for (std::uint32_t i = 0; i < trade_count; ++i) {
         Trade trade{};
         trade.buy_order_id = getU64(p);
@@ -474,14 +527,15 @@ Response applyRequest(const Request& request, MatchingEngine& engine) {
         case MessageType::Subscribe:
         case MessageType::Unsubscribe:
         case MessageType::MarketData:
+        case MessageType::ResyncMarketData:
             // None of these ever actually reach here in the real server:
-            // OrderServer intercepts Authenticate, Subscribe and Unsubscribe
-            // before calling applyRequest, since the engine has no notion of
-            // connections, credentials or subscriptions, and MarketData is
-            // never sent by a client at all. Kept exhaustive and given the
-            // same fallback as Response above, rather than a default:, so a
-            // real future request type here trips -Wswitch instead of
-            // silently reusing this branch.
+            // OrderServer intercepts Authenticate, Subscribe, Unsubscribe and
+            // ResyncMarketData before calling applyRequest, since the engine
+            // has no notion of connections, credentials or subscriptions,
+            // and MarketData is never sent by a client at all. Kept
+            // exhaustive and given the same fallback as Response above,
+            // rather than a default:, so a real future request type here
+            // trips -Wswitch instead of silently reusing this branch.
             response.reason = RejectReason::UnknownOrder;
             return response;
     }

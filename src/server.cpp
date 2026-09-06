@@ -230,14 +230,7 @@ bool OrderServer::serviceReadable(Connection& connection) {
                 continue;
             }
             connection.subscriptions.insert(request.symbol);
-            // The snapshot: current book state, current sequence (what has
-            // already happened), no trades -- this is not itself an event.
-            MarketDataMessage snapshot;
-            snapshot.correlation_id = correlation_id;
-            snapshot.symbol = request.symbol;
-            snapshot.sequence = market_data_sequence_[request.symbol];  // 0 if untouched so far
-            snapshot.best_bid = engine_.bestBid(request.symbol);
-            snapshot.best_ask = engine_.bestAsk(request.symbol);
+            const MarketDataMessage snapshot = buildSnapshot(request.symbol, correlation_id);
             encodeMarketData(snapshot, connection.outbox);
             ++requests_handled_;
             continue;
@@ -245,6 +238,14 @@ bool OrderServer::serviceReadable(Connection& connection) {
         if (type == MessageType::Unsubscribe) {
             connection.subscriptions.erase(request.symbol);  // no-op if absent -- idempotent
             queueResponse(connection, correlation_id, RejectReason::None);
+            continue;
+        }
+        if (type == MessageType::ResyncMarketData) {
+            if (!engine_.hasSymbol(request.symbol)) {
+                queueResponse(connection, correlation_id, RejectReason::UnknownSymbol);
+                continue;
+            }
+            if (!handleResyncMarketData(connection, request)) return false;
             continue;
         }
 
@@ -271,6 +272,19 @@ void OrderServer::queueResponse(Connection& connection, std::uint32_t correlatio
     ++requests_handled_;
 }
 
+MarketDataMessage OrderServer::buildSnapshot(const Symbol& symbol, std::uint32_t correlation_id) const {
+    MarketDataMessage snapshot;
+    snapshot.correlation_id = correlation_id;
+    snapshot.symbol = symbol;
+    snapshot.sequence = market_data_sequence_.count(symbol) != 0 ? market_data_sequence_.at(symbol) : 0;
+    snapshot.best_bid = engine_.bestBid(symbol);
+    snapshot.best_ask = engine_.bestAsk(symbol);
+    snapshot.bid_levels = engine_.bidLevels(symbol, market_data_depth_);
+    snapshot.ask_levels = engine_.askLevels(symbol, market_data_depth_);
+    // trades left empty: a snapshot reports current state, not an event.
+    return snapshot;
+}
+
 void OrderServer::broadcastMarketData(const Symbol& symbol, const std::vector<Trade>& trades) {
     // Increment before reading: this push's sequence is one past whatever a
     // concurrent Subscribe's snapshot would have just reported.
@@ -283,7 +297,18 @@ void OrderServer::broadcastMarketData(const Symbol& symbol, const std::vector<Tr
     message.sequence = sequence;
     message.best_bid = engine_.bestBid(symbol);
     message.best_ask = engine_.bestAsk(symbol);
+    message.bid_levels = engine_.bidLevels(symbol, market_data_depth_);
+    message.ask_levels = engine_.askLevels(symbol, market_data_depth_);
     message.trades = trades;
+
+    // Recorded before encoding: what ResyncMarketData replays from later.
+    // Capped at market_data_history_limit_ entries per symbol, oldest
+    // dropped first -- a gap wider than this many pushes can no longer be
+    // closed incrementally and falls back to buildSnapshot() instead, the
+    // same outcome a plain re-subscribe would have produced anyway.
+    std::deque<MarketDataMessage>& history = market_data_history_[symbol];
+    history.push_back(message);
+    if (history.size() > market_data_history_limit_) history.pop_front();
 
     std::vector<std::uint8_t> encoded;
     encodeMarketData(message, encoded);
@@ -308,6 +333,46 @@ void OrderServer::broadcastMarketData(const Symbol& symbol, const std::vector<Tr
             other.outbox.insert(other.outbox.end(), encoded.begin(), encoded.end());
         }
     }
+}
+
+bool OrderServer::handleResyncMarketData(Connection& connection, const Request& request) {
+    const auto history_it = market_data_history_.find(request.symbol);
+
+    // Backfillable exactly when there is a history buffer for this symbol
+    // AND it reaches back far enough to cover since_sequence without a gap:
+    // its oldest entry's sequence must be since_sequence + 1 or earlier.
+    // since_sequence >= the current sequence (nothing missed, including a
+    // symbol nothing has ever happened to) falls through to the snapshot
+    // branch too, since there would be zero entries to replay either way.
+    // Written as front().sequence - 1 <= since_sequence, not since_sequence
+    // + 1 >= front().sequence, so a since_sequence of UINT64_MAX (a
+    // malformed or malicious request, never a real client) can't wrap
+    // around to false positive; sequences always start at 1, so
+    // front().sequence - 1 itself never underflows.
+    const bool can_backfill = history_it != market_data_history_.end() &&
+                              !history_it->second.empty() &&
+                              request.since_sequence < market_data_sequence_[request.symbol] &&
+                              history_it->second.front().sequence - 1 <= request.since_sequence;
+
+    if (!can_backfill) {
+        const MarketDataMessage snapshot = buildSnapshot(request.symbol, request.correlation_id);
+        encodeMarketData(snapshot, connection.outbox);
+        ++requests_handled_;
+        return true;
+    }
+
+    // Every buffered message strictly after since_sequence, in order, each
+    // carrying this request's correlation id -- unlike a live push (always
+    // 0), so a client can tell "this is the resync I asked for" apart from
+    // whatever else might otherwise arrive on this connection meanwhile.
+    for (const MarketDataMessage& past : history_it->second) {
+        if (past.sequence <= request.since_sequence) continue;
+        MarketDataMessage reply = past;
+        reply.correlation_id = request.correlation_id;
+        encodeMarketData(reply, connection.outbox);
+    }
+    ++requests_handled_;
+    return true;
 }
 
 bool OrderServer::serviceWritable(Connection& connection) {
