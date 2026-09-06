@@ -189,9 +189,39 @@ bool OrderServer::serviceReadable(Connection& connection) {
             continue;
         }
 
+        if (type == MessageType::Subscribe) {
+            if (!engine_.hasSymbol(request.symbol)) {
+                queueResponse(connection, correlation_id, RejectReason::UnknownSymbol);
+                continue;
+            }
+            connection.subscriptions.insert(request.symbol);
+            // The snapshot: current book state, current sequence (what has
+            // already happened), no trades -- this is not itself an event.
+            MarketDataMessage snapshot;
+            snapshot.correlation_id = correlation_id;
+            snapshot.symbol = request.symbol;
+            snapshot.sequence = market_data_sequence_[request.symbol];  // 0 if untouched so far
+            snapshot.best_bid = engine_.bestBid(request.symbol);
+            snapshot.best_ask = engine_.bestAsk(request.symbol);
+            encodeMarketData(snapshot, connection.outbox);
+            ++requests_handled_;
+            continue;
+        }
+        if (type == MessageType::Unsubscribe) {
+            connection.subscriptions.erase(request.symbol);  // no-op if absent -- idempotent
+            queueResponse(connection, correlation_id, RejectReason::None);
+            continue;
+        }
+
         const Response response = applyRequest(request, engine_);
         encodeResponse(response, connection.outbox);
         ++requests_handled_;
+
+        if (response.reason == RejectReason::None && !request.symbol.empty() &&
+            (type == MessageType::LimitOrder || type == MessageType::MarketOrder ||
+             type == MessageType::ModifyOrder || type == MessageType::CancelOrder)) {
+            broadcastMarketData(request.symbol, response.trades);
+        }
     }
 
     return !connection.reader.failed();
@@ -204,6 +234,45 @@ void OrderServer::queueResponse(Connection& connection, std::uint32_t correlatio
     response.reason = reason;
     encodeResponse(response, connection.outbox);
     ++requests_handled_;
+}
+
+void OrderServer::broadcastMarketData(const Symbol& symbol, const std::vector<Trade>& trades) {
+    // Increment before reading: this push's sequence is one past whatever a
+    // concurrent Subscribe's snapshot would have just reported.
+    const std::uint64_t sequence = ++market_data_sequence_[symbol];
+
+    MarketDataMessage message;
+    // correlation_id left at its default (0): nothing requested this push,
+    // unlike the snapshot sent in direct reply to a Subscribe.
+    message.symbol = symbol;
+    message.sequence = sequence;
+    message.best_bid = engine_.bestBid(symbol);
+    message.best_ask = engine_.bestAsk(symbol);
+    message.trades = trades;
+
+    std::vector<std::uint8_t> encoded;
+    encodeMarketData(message, encoded);
+
+    // Every subscribed connection, including the one that just caused this
+    // -- its own Response already told it what happened to its order; this
+    // is the separate, public "the book changed" push everyone subscribed
+    // gets, itself included.
+    //
+    // This only appends to outbox; it deliberately does not also try to
+    // flush a recipient's socket here. serviceWritable() can decide a
+    // connection needs closing, and closeConnection() erases from
+    // connections_ -- which this loop is iterating, and which the caller's
+    // own `connection` (a reference into this same vector, from whichever
+    // index is currently being serviced in serviceReadable) is a reference
+    // into. Closing one here could invalidate the other. Queuing and
+    // leaving the flush to the next poll() iteration's ordinary
+    // serviceWritable pass costs at most kPollTimeoutMs of latency on an
+    // otherwise fully idle server, and sidesteps that risk entirely.
+    for (Connection& other : connections_) {
+        if (other.subscriptions.count(symbol) != 0) {
+            other.outbox.insert(other.outbox.end(), encoded.begin(), encoded.end());
+        }
+    }
 }
 
 bool OrderServer::serviceWritable(Connection& connection) {

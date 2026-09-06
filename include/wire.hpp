@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -55,6 +56,25 @@ enum class MessageType : std::uint8_t {
     // does not require authentication at all, this trivially succeeds; see
     // server.hpp.
     Authenticate = 7,
+    // Client -> server: start (or restart) receiving MarketData for a
+    // symbol on this connection. Payload is just the symbol, the same shape
+    // as AddSymbol. Rejected with a Response{UnknownSymbol} if the symbol
+    // isn't registered; otherwise answered with one MarketData snapshot
+    // (empty trades) and, from then on, a MarketData push after every
+    // request that changes that symbol's book. Subscribing again while
+    // already subscribed is a no-op that just resends the snapshot.
+    Subscribe = 8,
+    // Client -> server: stop receiving MarketData for a symbol on this
+    // connection. Always succeeds, including when not currently subscribed
+    // -- idempotent, like Subscribe.
+    Unsubscribe = 9,
+    // Server -> client only, like Response: never decoded as a client
+    // request. Sent once as the reply to a successful Subscribe (with
+    // `trades` empty, since nothing happened -- it's a snapshot, not an
+    // event), and again, unsolicited, after every accepted LimitOrder,
+    // MarketOrder, ModifyOrder or CancelOrder that touched a symbol this
+    // connection is subscribed to. See MarketDataMessage below.
+    MarketData = 10,
 };
 
 // One decoded client request. Fields not used by a given message type are left
@@ -80,12 +100,37 @@ struct Response {
     std::vector<Trade> trades;
 };
 
+// A push about one symbol's public book state: sent once as the answer to a
+// successful Subscribe, and again, unsolicited, after every subsequent
+// change to that symbol. `sequence` is a monotonic counter kept per symbol
+// by OrderServer, incremented before each unsolicited push and reported
+// as-is in a Subscribe snapshot -- so the snapshot's value is "what has
+// already happened," and a subscriber that then sees anything other than
+// sequence+1, +2, +3, ... next has missed one and should re-subscribe for a
+// fresh snapshot rather than trust what it has.
+//
+// `best_bid`/`best_ask` mirror MatchingEngine::bestBid/bestAsk's own
+// std::optional: unset means an empty side, not a sentinel price to
+// misinterpret as real.
+struct MarketDataMessage {
+    std::uint32_t correlation_id = 0;  // 0 on an unsolicited push; nothing requested it
+    Symbol symbol;
+    std::uint64_t sequence = 0;
+    std::optional<Price> best_bid;
+    std::optional<Price> best_ask;
+    std::vector<Trade> trades;  // empty on a Subscribe snapshot; may be empty on a push too
+};
+
 // Appends a complete framed message to `out`. False if the request cannot be
 // represented -- currently only an over-long symbol, which is rejected rather
 // than truncated, since truncation would silently alias two instruments onto
 // one book.
 bool encodeRequest(const Request& request, std::vector<std::uint8_t>& out);
 void encodeResponse(const Response& response, std::vector<std::uint8_t>& out);
+// False if `message.symbol` doesn't fit (see encodeRequest above); in
+// practice this can't happen, since the symbol always came from one already
+// validated the same way when a client's Subscribe request was decoded.
+bool encodeMarketData(const MarketDataMessage& message, std::vector<std::uint8_t>& out);
 
 // Decode a frame's payload; the header has already been read. False if the
 // payload is the wrong size for its type or otherwise malformed.
@@ -93,6 +138,8 @@ bool decodeRequest(MessageType type, std::uint32_t correlation_id, const std::ui
                    std::size_t length, Request& out);
 bool decodeResponse(std::uint32_t correlation_id, const std::uint8_t* payload, std::size_t length,
                     Response& out);
+bool decodeMarketData(std::uint32_t correlation_id, const std::uint8_t* payload, std::size_t length,
+                      MarketDataMessage& out);
 
 // Reassembles frames from a TCP byte stream.
 //

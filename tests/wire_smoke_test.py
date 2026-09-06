@@ -17,7 +17,8 @@ import tempfile
 import time
 
 VERSION = 1
-ADD_SYMBOL, LIMIT, MARKET, MODIFY, CANCEL, RESPONSE, AUTHENTICATE = 1, 2, 3, 4, 5, 6, 7
+(ADD_SYMBOL, LIMIT, MARKET, MODIFY, CANCEL, RESPONSE, AUTHENTICATE, SUBSCRIBE, UNSUBSCRIBE,
+ MARKET_DATA) = 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
 REASONS = {
     0: "ok", 1: "duplicate-id", 2: "unknown-order", 3: "bad-quantity", 4: "unknown-symbol",
     5: "not-authenticated", 6: "authentication-failed",
@@ -60,6 +61,14 @@ def authenticate(corr, token):
     return frame(AUTHENTICATE, corr, token.encode())
 
 
+def subscribe(corr, s):
+    return frame(SUBSCRIBE, corr, sym(s))
+
+
+def unsubscribe(corr, s):
+    return frame(UNSUBSCRIBE, corr, sym(s))
+
+
 def read_exactly(sock, n):
     buf = b""
     while len(buf) < n:
@@ -88,6 +97,31 @@ def read_response(sock):
     assert off == len(body), "trailing bytes in response"
     return {"corr": corr, "reason": REASONS.get(reason, reason), "self_trade": bool(flags),
             "unfilled": unfilled, "trades": trades}
+
+
+def read_market_data(sock):
+    header = read_exactly(sock, 12)
+    length, corr, mtype, version, _ = struct.unpack(">IIBBH", header)
+    assert mtype == MARKET_DATA, f"expected MarketData, got type {mtype}"
+    assert version == VERSION
+    body = read_exactly(sock, length)
+    symbol = body[0:8].split(b"\x00", 1)[0].decode()
+    (sequence,) = struct.unpack(">Q", body[8:16])
+    has_bid = body[16]
+    (bid_price,) = struct.unpack(">q", body[17:25])
+    has_ask = body[25]
+    (ask_price,) = struct.unpack(">q", body[26:34])
+    (count,) = struct.unpack(">I", body[34:38])
+    trades = []
+    off = 38
+    for _ in range(count):
+        b, s, p, q = struct.unpack(">QQqQ", body[off:off + 32])
+        trades.append((b, s, p, q))
+        off += 32
+    assert off == len(body), "trailing bytes in market data message"
+    return {"corr": corr, "symbol": symbol, "sequence": sequence,
+            "bid": bid_price if has_bid else None, "ask": ask_price if has_ask else None,
+            "trades": trades}
 
 
 def clean_env(overrides=None):
@@ -289,6 +323,62 @@ def main():
         s3 = socket.create_connection(("127.0.0.1", bind_port), timeout=5)
         s3.close()
         check("non-loopback bind with a token accepts a connection", True, True)
+    finally:
+        stop_server(proc, out)
+
+    # ---- market data ----
+    md_port = free_port()
+    proc, out = start_server(binary, md_port, os.path.join(workdir, "md.log"),
+                             os.path.join(workdir, "md.out"))
+    try:
+        # Connection A subscribes; connection B never does, and is what
+        # confirms broadcasts are scoped to subscribers, not sent to everyone.
+        a = socket.create_connection(("127.0.0.1", md_port), timeout=5)
+        a.sendall(add_symbol(1, "AAPL"))
+        read_response(a)
+        a.sendall(subscribe(2, "AAPL"))
+        snapshot = read_market_data(a)
+        check("subscribe snapshot corr", snapshot["corr"], 2)
+        check("subscribe snapshot on an empty book", (snapshot["sequence"], snapshot["bid"],
+                                                       snapshot["ask"], snapshot["trades"]),
+              (0, None, None, []))
+
+        b = socket.create_connection(("127.0.0.1", md_port), timeout=5)
+        b.sendall(limit(3, "AAPL", 100, 1, 10050, 5, 0))  # rest a sell; no trade yet
+        check("B's own response", read_response(b)["reason"], "ok")
+
+        push1 = read_market_data(a)
+        check("broadcast is unsolicited (corr 0)", push1["corr"], 0)
+        check("broadcast after a resting order", (push1["sequence"], push1["ask"], push1["trades"]),
+              (1, 10050, []))
+
+        # A crosses the resting sell itself: it gets its own Response, and
+        # then, separately, the public broadcast -- both, since it is
+        # subscribed and it is also the one who just traded.
+        a.sendall(limit(4, "AAPL", 200, 0, 10050, 3, 0))
+        own = read_response(a)
+        check("A's own trade", own["trades"], [(200, 100, 10050, 3)])
+        push2 = read_market_data(a)
+        check("broadcast reflects A's own trade", (push2["sequence"], push2["trades"]),
+              (2, [(200, 100, 10050, 3)]))
+
+        # B, never subscribed, has nothing extra waiting.
+        check("unsubscribed connection gets nothing extra", read_after_close_probe(b, timeout=1),
+              "still-open")
+
+        a.sendall(unsubscribe(5, "AAPL"))
+        check("unsubscribe acknowledged", read_response(a)["reason"], "ok")
+
+        b.sendall(limit(6, "AAPL", 300, 1, 10100, 2, 0))
+        read_response(b)
+        check("no further broadcast after unsubscribing", read_after_close_probe(a, timeout=1),
+              "still-open")
+
+        a.sendall(subscribe(7, "NVDA"))
+        check("subscribe to an unregistered symbol", read_response(a)["reason"], "unknown-symbol")
+
+        a.close()
+        b.close()
     finally:
         stop_server(proc, out)
 

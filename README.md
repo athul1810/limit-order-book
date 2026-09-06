@@ -41,6 +41,9 @@ interview, not a black box.
   anything else is accepted. A wrong token closes the connection; no token configured
   at all leaves it off entirely, and the server refuses to bind anywhere but loopback
   until one is set.
+- **Market data**: subscribe to a symbol over the same connection and get a snapshot
+  of its current best bid/ask, then a push after every subsequent trade or resting
+  order that touches it, with a sequence number for detecting a missed one.
 
 ## Design
 
@@ -168,8 +171,11 @@ This is a matching core, not a trading system. Missing on purpose, not by oversi
 - Rate limiting and account lockout on repeated wrong tokens. A failed attempt closes
   that one connection, but nothing stops a fresh connection from trying again
   immediately, so this is not a defence against a sustained guessing attack
-- Market data out. The protocol is request/response only: a client learns about its
-  own fills and nothing else. A real venue also publishes a book feed
+- Depth of book. A market data push carries only the best bid and best ask, not the
+  levels behind them; a subscriber sees that the top of the book moved, not why
+- Recovering a missed market data message other than by re-subscribing. There is no
+  way to ask for "everything since sequence N" -- a gap means re-subscribing for a
+  fresh snapshot and picking the sequence back up from there
 - Windows. The server uses POSIX sockets and `poll()`
 - Concurrency — the book is single-threaded by design; a real engine gets its
   concurrency at the I/O boundary, not inside the matching core itself. Per-symbol
@@ -352,8 +358,11 @@ python3 tests/wire_smoke_test.py ./matching_engine_server
 
 It starts a server on a free port and checks framing (several messages in one write,
 one message split across two writes), self-trade prevention, each rejection reason,
-negative prices, a second connection seeing the same book, and state surviving a
-restart. It found a real bug the C++ tests could not: `poll()` was being indexed by a
+negative prices, a second connection seeing the same book, state surviving a restart,
+authentication in both directions, and market data: a subscriber's snapshot, the
+unsolicited push after another connection's order, an unsubscribed connection getting
+nothing extra, and a stopped one after unsubscribing. It found a real bug the C++
+tests could not: `poll()` was being indexed by a
 connection count that `accept()` had already grown, so a newly accepted connection
 read past the end of the descriptor array and was dropped on the spot.
 
@@ -396,6 +405,53 @@ listening on 0.0.0.0:9001 (authentication required)
 
 Both come from the environment rather than a command-line flag. A secret has no
 business showing up in `ps`, which is where an argv-based flag would put it.
+
+### Market data
+
+Any connection can subscribe to a symbol's public book state, in addition to
+whatever orders it is submitting on the same connection:
+
+```
+Subscribe "AAPL"  -> a MarketData snapshot: current best bid/ask, sequence 0,
+                     no trades (a snapshot isn't itself an event)
+```
+
+From then on, that connection gets an unsolicited `MarketData` push after every
+accepted limit order, market order, modify or cancel that touches AAPL, on *any*
+connection, itself included:
+
+```
+someone submits an order on AAPL
+  -> MarketData: new best bid/ask, sequence 1, and the trades that just happened
+     (empty if the order simply rested without crossing anything)
+```
+
+The push and a connection's own `Response` to its own order are two separate
+messages, sent to a subscribed, acting connection in that order: `Response` says what
+happened to *your* order, `MarketData` says what the book's public state now is.
+Everyone subscribed gets the second one, including whoever caused it.
+
+`sequence` is what a gap looks like: a snapshot reports what has already happened, so
+the very next push should be exactly one more, and every push after that one more
+again. If a push ever arrives out of that order, something was missed, and the fix is
+to `Subscribe` again for a fresh snapshot rather than trust what has been received so
+far. There is no way to ask for "replay everything since sequence N" -- resubscribing
+is the only recovery path.
+
+Two design choices worth stating plainly. First, the trigger for a push is simple on
+purpose: any of those four request types succeeding, whether or not it happened to
+move the best price or produce a trade. An unfilled market order against an empty
+book still triggers a push (an unchanged bid/ask, no trades) rather than the server
+trying to detect "did anything actually change," which would be a second condition to
+get right for very little benefit. Second, subscribing requires the symbol to already
+exist -- `Subscribe` to one that doesn't is rejected the same way trading on it would
+be -- so a brand-new `SYMBOL`/`AddSymbol` never itself needs to push anything: nothing
+could be subscribed to a symbol that did not exist a moment earlier.
+
+`Unsubscribe` always succeeds, including when not currently subscribed, the same as
+`Subscribe` succeeding again while already subscribed just resends the snapshot. Both
+are idempotent on purpose, so a client doesn't have to track its own subscription
+state just to avoid an error from restating it.
 
 ## Tests and CI
 
@@ -466,7 +522,9 @@ written and installed before the log is ever touched) instead of reusing it.
 
 What would come next with more time:
 
-1. A market data feed, so clients can see the book and not just their own fills
-2. Encryption on the wire, so the token authentication checks is not sent in plain
-   text over anything but loopback
-3. Rate limiting on repeated failed authentication attempts
+1. Encryption on the wire, so the token that authentication checks is not sent in
+   plain text over anything but loopback
+2. Rate limiting on repeated failed authentication attempts
+3. Depth of book in a market data push, not just the best bid and ask
+4. A way to recover a missed market data message other than re-subscribing from
+   scratch

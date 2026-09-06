@@ -83,8 +83,14 @@ constexpr std::size_t kLimitOrderBytes = kSymbolBytes + 8 + 1 + 8 + 8 + 8;
 constexpr std::size_t kMarketOrderBytes = kSymbolBytes + 8 + 1 + 8 + 8;
 constexpr std::size_t kModifyOrderBytes = kSymbolBytes + 8 + 8 + 8;
 constexpr std::size_t kCancelOrderBytes = kSymbolBytes + 8;
+// Subscribe and Unsubscribe carry only a symbol, the same shape as
+// AddSymbol.
+constexpr std::size_t kSubscribeBytes = kSymbolBytes;
+constexpr std::size_t kUnsubscribeBytes = kSymbolBytes;
 constexpr std::size_t kResponseFixedBytes = 1 + 1 + 4 + 8;
 constexpr std::size_t kTradeBytes = 8 + 8 + 8 + 8;
+// symbol + sequence + has_bid + bid_price + has_ask + ask_price + trade_count
+constexpr std::size_t kMarketDataFixedBytes = kSymbolBytes + 8 + 1 + 8 + 1 + 8 + 4;
 
 bool sideFromByte(std::uint8_t value, Side& out) {
     if (value == 0) {
@@ -148,6 +154,10 @@ bool encodeRequest(const Request& request, std::vector<std::uint8_t>& out) {
 
     switch (request.type) {
         case MessageType::AddSymbol:
+        case MessageType::Subscribe:
+        case MessageType::Unsubscribe:
+            // All three are just a symbol, and putSymbol() above already
+            // wrote it.
             break;
         case MessageType::LimitOrder:
             putU64(out, request.order_id);
@@ -171,6 +181,7 @@ bool encodeRequest(const Request& request, std::vector<std::uint8_t>& out) {
             putU64(out, request.order_id);
             break;
         case MessageType::Response:
+        case MessageType::MarketData:
             out.resize(header_at);
             return false;  // not a client request
         case MessageType::Authenticate:
@@ -257,8 +268,17 @@ bool decodeRequest(MessageType type, std::uint32_t correlation_id, const std::ui
             // possibly-null `payload` at length 0.
             out.token.assign(length == 0 ? "" : reinterpret_cast<const char*>(payload), length);
             return true;
+        case MessageType::Subscribe:
+            if (length != kSubscribeBytes) return false;
+            out.symbol = getSymbol(payload);
+            return !out.symbol.empty();
+        case MessageType::Unsubscribe:
+            if (length != kUnsubscribeBytes) return false;
+            out.symbol = getSymbol(payload);
+            return !out.symbol.empty();
         case MessageType::Response:
-            return false;
+        case MessageType::MarketData:
+            return false;  // server -> client only, never a client request
     }
     return false;
 }
@@ -278,6 +298,67 @@ bool decodeResponse(std::uint32_t correlation_id, const std::uint8_t* payload, s
     }
     out.trades.reserve(trade_count);
     const std::uint8_t* p = payload + kResponseFixedBytes;
+    for (std::uint32_t i = 0; i < trade_count; ++i) {
+        Trade trade{};
+        trade.buy_order_id = getU64(p);
+        trade.sell_order_id = getU64(p + 8);
+        trade.price = getI64(p + 16);
+        trade.quantity = getU64(p + 24);
+        out.trades.push_back(trade);
+        p += kTradeBytes;
+    }
+    return true;
+}
+
+bool encodeMarketData(const MarketDataMessage& message, std::vector<std::uint8_t>& out) {
+    const std::size_t header_at = out.size();
+    out.resize(header_at + kHeaderBytes);
+
+    if (!putSymbol(out, message.symbol)) {
+        out.resize(header_at);
+        return false;
+    }
+    putU64(out, message.sequence);
+    putU8(out, message.best_bid.has_value() ? 1 : 0);
+    putI64(out, message.best_bid.value_or(0));
+    putU8(out, message.best_ask.has_value() ? 1 : 0);
+    putI64(out, message.best_ask.value_or(0));
+    putU32(out, static_cast<std::uint32_t>(message.trades.size()));
+    for (const Trade& trade : message.trades) {
+        putU64(out, trade.buy_order_id);
+        putU64(out, trade.sell_order_id);
+        putI64(out, trade.price);
+        putU64(out, trade.quantity);
+    }
+
+    writeHeader(out, header_at, MessageType::MarketData, message.correlation_id);
+    return true;
+}
+
+bool decodeMarketData(std::uint32_t correlation_id, const std::uint8_t* payload, std::size_t length,
+                      MarketDataMessage& out) {
+    out = MarketDataMessage{};
+    out.correlation_id = correlation_id;
+    if (length < kMarketDataFixedBytes) return false;
+
+    out.symbol = getSymbol(payload);
+    if (out.symbol.empty()) return false;
+    out.sequence = getU64(payload + 8);
+
+    const bool has_bid = payload[16] != 0;
+    const Price bid_price = getI64(payload + 17);
+    if (has_bid) out.best_bid = bid_price;
+
+    const bool has_ask = payload[25] != 0;
+    const Price ask_price = getI64(payload + 26);
+    if (has_ask) out.best_ask = ask_price;
+
+    const std::uint32_t trade_count = getU32(payload + 34);
+    if (length != kMarketDataFixedBytes + static_cast<std::size_t>(trade_count) * kTradeBytes) {
+        return false;
+    }
+    out.trades.reserve(trade_count);
+    const std::uint8_t* p = payload + kMarketDataFixedBytes;
     for (std::uint32_t i = 0; i < trade_count; ++i) {
         Trade trade{};
         trade.buy_order_id = getU64(p);
@@ -388,12 +469,17 @@ Response applyRequest(const Request& request, MatchingEngine& engine) {
             response.reason = RejectReason::UnknownOrder;
             return response;
         case MessageType::Authenticate:
-            // Never actually reaches here in the real server: OrderServer
-            // intercepts Authenticate before calling applyRequest, since the
-            // engine has no notion of connections or credentials. Kept
-            // exhaustive and given the same fallback as Response above,
-            // rather than a default:, so a real future request type here
-            // trips -Wswitch instead of silently reusing this branch.
+        case MessageType::Subscribe:
+        case MessageType::Unsubscribe:
+        case MessageType::MarketData:
+            // None of these ever actually reach here in the real server:
+            // OrderServer intercepts Authenticate, Subscribe and Unsubscribe
+            // before calling applyRequest, since the engine has no notion of
+            // connections, credentials or subscriptions, and MarketData is
+            // never sent by a client at all. Kept exhaustive and given the
+            // same fallback as Response above, rather than a default:, so a
+            // real future request type here trips -Wswitch instead of
+            // silently reusing this branch.
             response.reason = RejectReason::UnknownOrder;
             return response;
     }

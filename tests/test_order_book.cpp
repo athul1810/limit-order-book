@@ -1295,6 +1295,121 @@ void test_reject_reason_describe_covers_auth_reasons() {
     std::cout << "test_reject_reason_describe_covers_auth_reasons passed\n";
 }
 
+// ---- market data (wire.hpp's MarketDataMessage, MessageType::Subscribe/Unsubscribe) ----
+
+void test_subscribe_and_unsubscribe_round_trip_like_add_symbol() {
+    for (MessageType type : {MessageType::Subscribe, MessageType::Unsubscribe}) {
+        Request request;
+        request.type = type;
+        request.correlation_id = 9;
+        request.symbol = "AAPL";
+
+        std::vector<std::uint8_t> bytes;
+        CHECK(encodeRequest(request, bytes));
+
+        FrameReader reader;
+        reader.append(bytes.data(), bytes.size());
+        MessageType decoded_type;
+        std::uint32_t correlation_id = 0;
+        std::vector<std::uint8_t> payload;
+        CHECK(reader.next(decoded_type, correlation_id, payload));
+        CHECK(decoded_type == type);
+
+        Request decoded;
+        CHECK(decodeRequest(decoded_type, correlation_id, payload.data(), payload.size(), decoded));
+        CHECK(decoded.symbol == "AAPL");
+        CHECK(decoded.correlation_id == 9);
+    }
+    std::cout << "test_subscribe_and_unsubscribe_round_trip_like_add_symbol passed\n";
+}
+
+void test_market_data_round_trips_bid_ask_and_trades() {
+    MarketDataMessage message;
+    message.correlation_id = 7;
+    message.symbol = "AAPL";
+    message.sequence = 42;
+    message.best_bid = 100'50;
+    message.best_ask = 101'00;
+    message.trades = {Trade{1, 2, 100'75, 5, 0}, Trade{3, 4, 100'80, 2, 0}};
+
+    std::vector<std::uint8_t> bytes;
+    CHECK(encodeMarketData(message, bytes));
+
+    FrameReader reader;
+    reader.append(bytes.data(), bytes.size());
+    MessageType type;
+    std::uint32_t correlation_id = 0;
+    std::vector<std::uint8_t> payload;
+    CHECK(reader.next(type, correlation_id, payload));
+    CHECK(type == MessageType::MarketData);
+    CHECK(correlation_id == 7);
+
+    MarketDataMessage decoded;
+    CHECK(decodeMarketData(correlation_id, payload.data(), payload.size(), decoded));
+    CHECK(decoded.symbol == "AAPL");
+    CHECK(decoded.sequence == 42);
+    CHECK(decoded.best_bid.has_value() && *decoded.best_bid == 100'50);
+    CHECK(decoded.best_ask.has_value() && *decoded.best_ask == 101'00);
+    CHECK(decoded.trades.size() == 2);
+    CHECK(decoded.trades[0].price == 100'75 && decoded.trades[0].quantity == 5);
+    CHECK(decoded.trades[1].price == 100'80 && decoded.trades[1].quantity == 2);
+    std::cout << "test_market_data_round_trips_bid_ask_and_trades passed\n";
+}
+
+// The snapshot sent on a successful Subscribe to a symbol with an empty book
+// is exactly this shape: no bid, no ask, no trades, sequence 0.
+void test_market_data_round_trips_an_empty_book() {
+    MarketDataMessage message;
+    message.symbol = "MSFT";
+    message.sequence = 0;
+    // best_bid, best_ask, trades all left at their default-constructed
+    // "nothing" -- std::nullopt and empty, respectively.
+
+    std::vector<std::uint8_t> bytes;
+    CHECK(encodeMarketData(message, bytes));
+
+    FrameReader reader;
+    reader.append(bytes.data(), bytes.size());
+    MessageType type;
+    std::uint32_t correlation_id = 0;
+    std::vector<std::uint8_t> payload;
+    CHECK(reader.next(type, correlation_id, payload));
+
+    MarketDataMessage decoded;
+    CHECK(decodeMarketData(correlation_id, payload.data(), payload.size(), decoded));
+    CHECK(!decoded.best_bid.has_value());
+    CHECK(!decoded.best_ask.has_value());
+    CHECK(decoded.trades.empty());
+    CHECK(decoded.sequence == 0);
+    std::cout << "test_market_data_round_trips_an_empty_book passed\n";
+}
+
+// MarketData is server -> client only, exactly like Response, so it must be
+// rejected if anything ever tries to decode one as an incoming client
+// request.
+void test_decode_request_rejects_market_data_as_a_client_request() {
+    Request out;
+    const std::uint8_t payload[1] = {0};
+    CHECK(!decodeRequest(MessageType::MarketData, 1, payload, 0, out));
+    std::cout << "test_decode_request_rejects_market_data_as_a_client_request passed\n";
+}
+
+// applyRequest never actually sees a live Subscribe, Unsubscribe or
+// MarketData request -- OrderServer intercepts the first two, and the third
+// is never sent by a client at all -- but the switch still has to handle
+// every MessageType, so this pins down what those unreachable-in-practice
+// branches do.
+void test_apply_request_does_not_understand_subscription_types() {
+    MatchingEngine engine;
+    for (MessageType type : {MessageType::Subscribe, MessageType::Unsubscribe, MessageType::MarketData}) {
+        Request request;
+        request.type = type;
+        request.symbol = "AAPL";
+        CHECK(applyRequest(request, engine).reason != RejectReason::None);
+    }
+    std::cout << "test_apply_request_does_not_understand_subscription_types passed\n";
+}
+
 // ---- shared recovery (recovery.hpp) ----
 //
 // The CLI and the server used to each carry their own ~50-line copy of
@@ -1665,6 +1780,11 @@ int main() {
     test_authenticate_with_an_empty_token_round_trips();
     test_apply_request_does_not_understand_authenticate();
     test_reject_reason_describe_covers_auth_reasons();
+    test_subscribe_and_unsubscribe_round_trip_like_add_symbol();
+    test_market_data_round_trips_bid_ask_and_trades();
+    test_market_data_round_trips_an_empty_book();
+    test_decode_request_rejects_market_data_as_a_client_request();
+    test_apply_request_does_not_understand_subscription_types();
     test_recover_from_nonexistent_log_starts_empty_and_logs_from_zero();
     test_recover_from_existing_log_replays_and_continues_sequence();
     test_recover_from_snapshot_and_log_tail_on_disk();

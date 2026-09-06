@@ -5,6 +5,8 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "matching_engine.hpp"
@@ -77,6 +79,10 @@ class OrderServer {
         std::size_t sent = 0;  // how much of outbox has already gone out
         // Meaningless (never consulted) when required_token_ is unset.
         bool authenticated = false;
+        // Symbols this connection has Subscribed to and not since
+        // Unsubscribed from. Checked on every broadcastMarketData() call, so
+        // membership testing matters more here than insertion order.
+        std::unordered_set<Symbol> subscriptions;
     };
 
     void acceptPending();
@@ -85,10 +91,20 @@ class OrderServer {
     bool serviceWritable(Connection& connection);
     void closeConnection(std::size_t index);
     // Queues a Response carrying only `reason` (no trades, no unfilled) and
-    // counts it toward requests_handled_. Used for the three outcomes that
-    // never touch the engine: an Authenticate attempt succeeding or failing,
-    // and a non-Authenticate request arriving before one has.
+    // counts it toward requests_handled_. Used for the outcomes that never
+    // touch the engine: an Authenticate attempt succeeding or failing, a
+    // non-Authenticate request arriving before one has, and Unsubscribe
+    // (always this, with RejectReason::None -- it is unconditional).
     void queueResponse(Connection& connection, std::uint32_t correlation_id, RejectReason reason);
+    // Pushes one MarketData message, carrying `trades`, to every connection
+    // subscribed to `symbol` -- called after every accepted LimitOrder,
+    // MarketOrder, ModifyOrder or CancelOrder that touched a symbol, whether
+    // or not that request happened to produce a trade or move the best
+    // price. A simple, uniform trigger ("this request type succeeded")
+    // costs an occasional no-op push (an unfilled market order against an
+    // empty book, say) in exchange for not having to detect "did the book
+    // actually visibly change" as a second, easy-to-get-wrong condition.
+    void broadcastMarketData(const Symbol& symbol, const std::vector<Trade>& trades);
 
     MatchingEngine& engine_;
     int listener_ = -1;
@@ -98,6 +114,10 @@ class OrderServer {
     std::uint64_t requests_handled_ = 0;
     std::function<void()> idle_hook_;
     std::optional<std::string> required_token_;
+    // The sequence of the LAST MarketData broadcast for each symbol (0 if
+    // none yet) -- see MarketDataMessage in wire.hpp for the exact contract
+    // this is the server-side half of.
+    std::unordered_map<Symbol, std::uint64_t> market_data_sequence_;
 };
 
 }  // namespace matching_engine
