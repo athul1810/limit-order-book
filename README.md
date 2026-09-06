@@ -40,7 +40,8 @@ interview, not a black box.
 - **Authentication**: an optional shared token, checked on every connection before
   anything else is accepted. A wrong token closes the connection; no token configured
   at all leaves it off entirely, and the server refuses to bind anywhere but loopback
-  until one is set.
+  until one is set. A source that fails too many attempts in a row is locked out for
+  a cooldown period, tracked per source address rather than per connection.
 - **Market data**: subscribe to a symbol over the same connection and get a snapshot
   of its current best bid/ask, then a push after every subsequent trade or resting
   order that touches it, with a sequence number for detecting a missed one.
@@ -168,9 +169,6 @@ This is a matching core, not a trading system. Missing on purpose, not by oversi
   is and a routable network generally is not. Encrypting the connection itself (TLS,
   most plausibly) is a separate piece of work from checking a credential once it
   arrives, and is still missing
-- Rate limiting and account lockout on repeated wrong tokens. A failed attempt closes
-  that one connection, but nothing stops a fresh connection from trying again
-  immediately, so this is not a defence against a sustained guessing attack
 - Depth of book. A market data push carries only the best bid and best ask, not the
   levels behind them; a subscriber sees that the top of the book moved, not why
 - Recovering a missed market data message other than by re-subscribing. There is no
@@ -379,16 +377,38 @@ A connection has to send an `Authenticate` message, whose payload is the raw tok
 and nothing else, before anything else is accepted. Any other request arriving first
 is rejected with `NotAuthenticated`, but the connection stays open, since simply not
 having authenticated yet is not by itself hostile. A wrong token gets rejected with
-`AuthenticationFailed`, and the connection is then closed: there is no rate limiting
-here, so leaving it open for repeated guesses would make the connection a free
-brute-force oracle. A fresh connection can still try again, which at least costs a
-TCP handshake per attempt, not nothing, but not a real defence against a sustained
-attack either.
+`AuthenticationFailed`, and the connection is then closed, which at least costs a
+fresh TCP handshake for the next attempt: not a real defence against a sustained
+attack on its own, which is what rate limiting, below, is for.
 
 The token comparison is constant-time (it does not short-circuit on the first
 mismatching byte), which closes the usual timing side-channel on comparing a secret,
 though the check still leaks the two lengths matching or not before that, the
 accepted trade-off for a comparison shaped like this one.
+
+A source (identified by peer IP) that fails five `Authenticate` attempts in a row is
+locked out for 30 seconds: every further attempt from it, right token included, is
+rejected with `RateLimited` without the token even being compared, until the lockout
+expires. A real success clears the count, so one mistyped token does not linger
+against a source that then authenticates correctly. Both numbers are configurable
+via `MATCHING_ENGINE_MAX_AUTH_FAILURES` and `MATCHING_ENGINE_AUTH_LOCKOUT_SECONDS`
+should the defaults not suit a given deployment:
+
+```bash
+MATCHING_ENGINE_TOKEN=some-shared-secret MATCHING_ENGINE_MAX_AUTH_FAILURES=3 \
+    MATCHING_ENGINE_AUTH_LOCKOUT_SECONDS=60 ./matching_engine_server 9001 book.log
+
+# three wrong-token attempts, each its own connection:
+attempt 1 (wrong token): authentication-failed
+attempt 2 (wrong token): authentication-failed
+attempt 3 (wrong token): authentication-failed
+# a fourth attempt, correct token this time, arrives while still locked out:
+attempt 4 (correct token, but locked out): rate-limited
+```
+
+Tracking by peer IP rather than by connection is the entire point: tracking per
+connection would make the lockout trivial to route around simply by reconnecting,
+since a fresh connection is exactly what a wrong token already forces anyway.
 
 `MATCHING_ENGINE_BIND` sets the address to listen on, defaulting to loopback exactly
 as before. Binding anywhere else is refused unless `MATCHING_ENGINE_TOKEN` is also
@@ -524,7 +544,6 @@ What would come next with more time:
 
 1. Encryption on the wire, so the token that authentication checks is not sent in
    plain text over anything but loopback
-2. Rate limiting on repeated failed authentication attempts
-3. Depth of book in a market data push, not just the best bid and ask
-4. A way to recover a missed market data message other than re-subscribing from
+2. Depth of book in a market data push, not just the best bid and ask
+3. A way to recover a missed market data message other than re-subscribing from
    scratch

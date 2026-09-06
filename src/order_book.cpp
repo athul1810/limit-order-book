@@ -15,6 +15,7 @@ const char* describe(RejectReason reason) {
         case RejectReason::UnknownSymbol: return "unknown symbol";
         case RejectReason::NotAuthenticated: return "not authenticated";
         case RejectReason::AuthenticationFailed: return "authentication failed";
+        case RejectReason::RateLimited: return "rate limited: too many recent failed authentication attempts";
     }
     return "unknown rejection";
 }

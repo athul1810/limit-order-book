@@ -135,6 +135,18 @@ void OrderServer::acceptPending() {
 
         Connection connection;
         connection.fd = fd;
+        // Best-effort: an address that can't be resolved (should not happen
+        // for an already-accepted AF_INET connection) just means this source
+        // never matches another attempt's peer_ip, so rate limiting quietly
+        // stops applying to it rather than the accept itself failing.
+        sockaddr_in peer{};
+        socklen_t peer_len = sizeof(peer);
+        if (::getpeername(fd, reinterpret_cast<sockaddr*>(&peer), &peer_len) == 0) {
+            char buf[INET_ADDRSTRLEN];
+            if (::inet_ntop(AF_INET, &peer.sin_addr, buf, sizeof(buf)) != nullptr) {
+                connection.peer_ip = buf;
+            }
+        }
         connections_.push_back(std::move(connection));
     }
 }
@@ -168,15 +180,38 @@ bool OrderServer::serviceReadable(Connection& connection) {
         }
 
         if (type == MessageType::Authenticate) {
+            const auto now = std::chrono::steady_clock::now();
+            const auto locked = auth_failures_.find(connection.peer_ip);
+            if (locked != auth_failures_.end() && now < locked->second.locked_until) {
+                // Locked out: rejected without even looking at the token, so
+                // a source serving out a lockout learns nothing more from
+                // trying again than "still locked out" -- not, say, "that
+                // one would have worked".
+                queueResponse(connection, correlation_id, RejectReason::RateLimited);
+                serviceWritable(connection);
+                return false;
+            }
+
             if (!required_token_.has_value() || constantTimeEquals(request.token, *required_token_)) {
                 connection.authenticated = true;
+                // A real success clears any failure history for this
+                // source -- it is who it says it is now, and holding a grudge
+                // from before would only punish it for having mistyped a
+                // token once, previously.
+                auth_failures_.erase(connection.peer_ip);
                 queueResponse(connection, correlation_id, RejectReason::None);
                 continue;
             }
             // Wrong token: tell the client why, then close the connection.
-            // There is no rate limiting here, so leaving the connection open
-            // for more attempts would make this a free brute-force oracle;
-            // a fresh connection at least costs a TCP handshake per try.
+            // Closing costs a fresh TCP handshake per retry on its own; the
+            // failure count below is what actually stops sustained guessing,
+            // by locking the source out entirely once it crosses the
+            // threshold, handshake cost or not.
+            AuthFailureState& state = auth_failures_[connection.peer_ip];
+            if (++state.consecutive_failures >= max_auth_failures_) {
+                state.locked_until = now + auth_lockout_duration_;
+                state.consecutive_failures = 0;
+            }
             queueResponse(connection, correlation_id, RejectReason::AuthenticationFailed);
             serviceWritable(connection);  // best-effort flush before closing
             return false;

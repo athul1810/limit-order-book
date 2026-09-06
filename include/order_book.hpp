@@ -48,6 +48,12 @@ enum class RejectReason {
     NotAuthenticated,
     // Wire-level only: an Authenticate attempt presented the wrong token.
     AuthenticationFailed,
+    // Wire-level only: this source has failed authentication too many times
+    // recently and is locked out for a cooldown period. Returned even when
+    // the token in this particular attempt is correct, since the whole point
+    // is to stop a locked-out source from learning anything more than "still
+    // locked out" -- see OrderServer in server.hpp.
+    RateLimited,
 };
 
 // Human-readable form of a RejectReason, for logs and CLI output.

@@ -115,6 +115,7 @@ bool reasonFromByte(std::uint8_t value, RejectReason& out) {
         case 4: out = RejectReason::UnknownSymbol; return true;
         case 5: out = RejectReason::NotAuthenticated; return true;
         case 6: out = RejectReason::AuthenticationFailed; return true;
+        case 7: out = RejectReason::RateLimited; return true;
         default: return false;
     }
 }
@@ -128,6 +129,7 @@ std::uint8_t reasonToByte(RejectReason reason) {
         case RejectReason::UnknownSymbol: return 4;
         case RejectReason::NotAuthenticated: return 5;
         case RejectReason::AuthenticationFailed: return 6;
+        case RejectReason::RateLimited: return 7;
     }
     return 0;
 }

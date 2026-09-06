@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -35,8 +36,29 @@ class OrderServer {
     // is not required at all, and an Authenticate request always trivially
     // succeeds -- useful for a client that always authenticates regardless
     // of whether the server it happens to be talking to requires it.
-    explicit OrderServer(MatchingEngine& engine, std::optional<std::string> required_token = std::nullopt)
-        : engine_(engine), required_token_(std::move(required_token)) {}
+    //
+    // `max_auth_failures` and `auth_lockout_duration` govern rate limiting on
+    // repeated wrong tokens: a source (identified by peer IP -- see
+    // Connection::peer_ip below) that fails that many Authenticate attempts
+    // in a row is locked out for that long, meaning every further
+    // Authenticate from it is rejected with RejectReason::RateLimited without
+    // even comparing the token, until the lockout expires. Meaningless when
+    // `required_token` is unset, since nothing there can ever fail. The
+    // defaults are deliberately conservative rather than tuned; a real
+    // deployment with actual attack data to look at would want its own
+    // numbers.
+    static constexpr std::uint32_t kDefaultMaxAuthFailures = 5;
+    static constexpr std::chrono::steady_clock::duration kDefaultAuthLockoutDuration =
+        std::chrono::seconds(30);
+
+    explicit OrderServer(MatchingEngine& engine, std::optional<std::string> required_token = std::nullopt,
+                         std::uint32_t max_auth_failures = kDefaultMaxAuthFailures,
+                         std::chrono::steady_clock::duration auth_lockout_duration =
+                             kDefaultAuthLockoutDuration)
+        : engine_(engine),
+          required_token_(std::move(required_token)),
+          max_auth_failures_(max_auth_failures),
+          auth_lockout_duration_(auth_lockout_duration) {}
     ~OrderServer();
 
     OrderServer(const OrderServer&) = delete;
@@ -79,6 +101,12 @@ class OrderServer {
         std::size_t sent = 0;  // how much of outbox has already gone out
         // Meaningless (never consulted) when required_token_ is unset.
         bool authenticated = false;
+        // Set once, from getpeername() at accept() time. What rate limiting
+        // keys on: a fresh connection is free (a new TCP handshake), but it
+        // still arrives from the same address, so tracking failures per
+        // connection would let a bad token be retried indefinitely just by
+        // reconnecting.
+        std::string peer_ip;
         // Symbols this connection has Subscribed to and not since
         // Unsubscribed from. Checked on every broadcastMarketData() call, so
         // membership testing matters more here than insertion order.
@@ -106,6 +134,19 @@ class OrderServer {
     // actually visibly change" as a second, easy-to-get-wrong condition.
     void broadcastMarketData(const Symbol& symbol, const std::vector<Trade>& trades);
 
+    // Rate-limiting state for one source: how many Authenticate attempts it
+    // has failed in a row since its last success (or since the last time a
+    // lockout was imposed), and, once that reaches max_auth_failures_, the
+    // point in time the lockout it triggered expires. consecutive_failures
+    // resets to 0 the moment a lockout is imposed, not just on eventual
+    // success -- so a source that keeps trying gets a fresh run at the
+    // threshold each time its lockout ends, rather than staying locked out
+    // forever on an ever-growing count.
+    struct AuthFailureState {
+        std::uint32_t consecutive_failures = 0;
+        std::chrono::steady_clock::time_point locked_until{};
+    };
+
     MatchingEngine& engine_;
     int listener_ = -1;
     std::uint16_t bound_port_ = 0;
@@ -114,6 +155,12 @@ class OrderServer {
     std::uint64_t requests_handled_ = 0;
     std::function<void()> idle_hook_;
     std::optional<std::string> required_token_;
+    std::uint32_t max_auth_failures_;
+    std::chrono::steady_clock::duration auth_lockout_duration_;
+    // Keyed by peer IP, not by connection -- see Connection::peer_ip. Absent
+    // entry means "no recent failures", the common case, so a source that has
+    // never gotten anything wrong never occupies a slot here.
+    std::unordered_map<std::string, AuthFailureState> auth_failures_;
     // The sequence of the LAST MarketData broadcast for each symbol (0 if
     // none yet) -- see MarketDataMessage in wire.hpp for the exact contract
     // this is the server-side half of.

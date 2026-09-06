@@ -1,3 +1,4 @@
+#include <chrono>
 #include <csignal>
 #include <cstdlib>
 #include <fstream>
@@ -59,6 +60,22 @@ int main(int argc, char** argv) {
     const std::string bind_address =
         (bind_env != nullptr && *bind_env != '\0') ? std::string(bind_env) : "127.0.0.1";
 
+    // Both optional, both fall back to OrderServer's own defaults when unset
+    // or unparsable -- a malformed override should not be able to disable
+    // rate limiting outright by accident.
+    std::uint32_t max_auth_failures = OrderServer::kDefaultMaxAuthFailures;
+    if (const char* max_failures_env = std::getenv("MATCHING_ENGINE_MAX_AUTH_FAILURES");
+        max_failures_env != nullptr && *max_failures_env != '\0') {
+        const long parsed = std::atol(max_failures_env);
+        if (parsed > 0) max_auth_failures = static_cast<std::uint32_t>(parsed);
+    }
+    std::chrono::steady_clock::duration auth_lockout_duration = OrderServer::kDefaultAuthLockoutDuration;
+    if (const char* lockout_env = std::getenv("MATCHING_ENGINE_AUTH_LOCKOUT_SECONDS");
+        lockout_env != nullptr && *lockout_env != '\0') {
+        const long parsed = std::atol(lockout_env);
+        if (parsed > 0) auth_lockout_duration = std::chrono::seconds(parsed);
+    }
+
     MatchingEngine engine;
 
     // Same recovery path as the CLI -- see recovery.hpp. A server that
@@ -86,7 +103,7 @@ int main(int argc, char** argv) {
         log = std::move(recovered.log);
     }
 
-    OrderServer server(engine, required_token);
+    OrderServer server(engine, required_token, max_auth_failures, auth_lockout_duration);
 
     // Unlike the CLI, the server has a genuine idle tick (the poll loop's
     // own timeout) independent of request traffic, so a wall-clock trigger

@@ -21,7 +21,7 @@ VERSION = 1
  MARKET_DATA) = 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
 REASONS = {
     0: "ok", 1: "duplicate-id", 2: "unknown-order", 3: "bad-quantity", 4: "unknown-symbol",
-    5: "not-authenticated", 6: "authentication-failed",
+    5: "not-authenticated", 6: "authentication-failed", 7: "rate-limited",
 }
 
 
@@ -132,6 +132,8 @@ def clean_env(overrides=None):
     env = dict(os.environ)
     env.pop("MATCHING_ENGINE_TOKEN", None)
     env.pop("MATCHING_ENGINE_BIND", None)
+    env.pop("MATCHING_ENGINE_MAX_AUTH_FAILURES", None)
+    env.pop("MATCHING_ENGINE_AUTH_LOCKOUT_SECONDS", None)
     if overrides:
         env.update(overrides)
     return env
@@ -301,6 +303,48 @@ def main():
         s2.sendall(add_symbol(4, "AAPL"))
         check("request after authenticating", read_response(s2)["reason"], "ok")
         s2.close()
+    finally:
+        stop_server(proc, out)
+
+    # ---- rate limiting on repeated failed authentication ----
+    # A short fuse (2 failures, 1 second) so this test doesn't sit around --
+    # the mechanism being exercised is "after enough failures, locked out for
+    # a while", not any particular threshold or duration.
+    rl_port = free_port()
+    proc, out = start_server(binary, rl_port, os.path.join(workdir, "ratelimit.log"),
+                             os.path.join(workdir, "ratelimit.out"),
+                             env_overrides={"MATCHING_ENGINE_TOKEN": "s3cr3t-token",
+                                            "MATCHING_ENGINE_MAX_AUTH_FAILURES": "2",
+                                            "MATCHING_ENGINE_AUTH_LOCKOUT_SECONDS": "1"})
+    try:
+        # Two wrong-token attempts, each its own fresh connection -- exactly
+        # what a real attacker gets to do for free, and exactly what rate
+        # limiting has to stop being sufficient on its own.
+        s = socket.create_connection(("127.0.0.1", rl_port), timeout=5)
+        s.sendall(authenticate(1, "wrong-token"))
+        check("first wrong attempt just fails", read_response(s)["reason"], "authentication-failed")
+        s.close()
+
+        s = socket.create_connection(("127.0.0.1", rl_port), timeout=5)
+        s.sendall(authenticate(2, "wrong-token"))
+        check("second wrong attempt trips the lockout", read_response(s)["reason"],
+              "authentication-failed")
+        s.close()
+
+        # Third attempt, correct token this time, but the source is locked
+        # out: the token is never even looked at.
+        s = socket.create_connection(("127.0.0.1", rl_port), timeout=5)
+        s.sendall(authenticate(3, "s3cr3t-token"))
+        check("correct token rejected while locked out", read_response(s)["reason"], "rate-limited")
+        check("connection closed while locked out", read_after_close_probe(s), "closed")
+        s.close()
+
+        time.sleep(1.3)  # past the one-second lockout
+
+        s = socket.create_connection(("127.0.0.1", rl_port), timeout=5)
+        s.sendall(authenticate(4, "s3cr3t-token"))
+        check("correct token accepted once the lockout expires", read_response(s)["reason"], "ok")
+        s.close()
     finally:
         stop_server(proc, out)
 

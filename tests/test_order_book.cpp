@@ -1292,7 +1292,37 @@ void test_apply_request_does_not_understand_authenticate() {
 void test_reject_reason_describe_covers_auth_reasons() {
     CHECK(std::string(describe(RejectReason::NotAuthenticated)) == "not authenticated");
     CHECK(std::string(describe(RejectReason::AuthenticationFailed)) == "authentication failed");
+    CHECK(std::string(describe(RejectReason::RateLimited)) ==
+           "rate limited: too many recent failed authentication attempts");
     std::cout << "test_reject_reason_describe_covers_auth_reasons passed\n";
+}
+
+// RateLimited is never produced by applyRequest either -- like
+// NotAuthenticated and AuthenticationFailed, OrderServer decides it before
+// the engine is ever consulted (see server.cpp's rate-limiting check ahead
+// of the token comparison). What needs pinning down here is only that the
+// wire format itself carries the value intact.
+void test_response_round_trips_rate_limited_reason() {
+    Response sent;
+    sent.correlation_id = 7;
+    sent.reason = RejectReason::RateLimited;
+
+    std::vector<std::uint8_t> bytes;
+    encodeResponse(sent, bytes);
+
+    FrameReader reader;
+    reader.append(bytes.data(), bytes.size());
+    MessageType type;
+    std::uint32_t correlation_id = 0;
+    std::vector<std::uint8_t> payload;
+    CHECK(reader.next(type, correlation_id, payload));
+    CHECK(type == MessageType::Response);
+
+    Response got;
+    CHECK(decodeResponse(correlation_id, payload.data(), payload.size(), got));
+    CHECK(got.correlation_id == 7);
+    CHECK(got.reason == RejectReason::RateLimited);
+    std::cout << "test_response_round_trips_rate_limited_reason passed\n";
 }
 
 // ---- market data (wire.hpp's MarketDataMessage, MessageType::Subscribe/Unsubscribe) ----
@@ -1780,6 +1810,7 @@ int main() {
     test_authenticate_with_an_empty_token_round_trips();
     test_apply_request_does_not_understand_authenticate();
     test_reject_reason_describe_covers_auth_reasons();
+    test_response_round_trips_rate_limited_reason();
     test_subscribe_and_unsubscribe_round_trip_like_add_symbol();
     test_market_data_round_trips_bid_ask_and_trades();
     test_market_data_round_trips_an_empty_book();
