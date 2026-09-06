@@ -13,21 +13,21 @@ interview, not a black box.
 - **Limit orders**: match immediately against the opposite side while prices cross;
   any unfilled remainder rests in the book.
 - **Market orders**: sweep the best available prices until filled or the book side is
-  empty. Never rest — an unfilled market order is simply discarded.
+  empty. Never rest: an unfilled market order is simply discarded.
 - **Cancellation**: O(1) average-case removal of a resting order by id.
 - **Cancel-replace**: repoint a resting order at a new price and quantity, keeping
   its id. Shrinking at an unchanged price keeps queue position; a reprice or a size
-  increase surrenders it, and re-enters the book as a fresh arrival — so repricing
+  increase surrenders it, and re-enters the book as a fresh arrival, so repricing
   aggressively enough to cross will trade immediately.
 - **Duplicate-id rejection**: a submission reusing the id of an order that is
   still resting is rejected outright, leaving the book untouched. An id becomes
   free again once its order is cancelled or fully filled.
 - **Price-time priority**: better price always wins; within the same price level,
   first-in-first-filled.
-- **Exact prices**: prices are integer ticks, so equal prices are always equal —
+- **Exact prices**: prices are integer ticks, so equal prices are always equal:
   no float drift splitting a price level in two or leaving a crossed book unmatched.
 - **Self-trade prevention**: an incoming order never trades against a resting order
-  belonging to the same participant. Two policies — cancel the resting order and let
+  belonging to the same participant. Two policies: cancel the resting order and let
   the aggressor continue (the default), or cancel the aggressor.
 - **Multiple instruments**: a `MatchingEngine` routes orders to a book per symbol.
 - **Persistence**: an append-only write-ahead log of every request, replayable to
@@ -68,7 +68,7 @@ interview, not a black box.
   next level no longer crosses.
 - Submissions return a `SubmitResult` (`accepted`, `unfilled`, and the trades) rather
   than a bare trade vector. `accepted` distinguishes a rejected order from an accepted
-  one that simply didn't cross — both produce no trades, but only one changed the book.
+  one that simply didn't cross; both produce no trades, but only one changed the book.
   `unfilled` is the remainder, which means different things for the two order types
   because they dispose of it differently: a limit order rests it, a market order throws
   it away. Without it a caller had no way to learn how much of a market order evaporated.
@@ -79,20 +79,20 @@ interview, not a black box.
   through that path is a size reduction at an unchanged price, which is edited in place
   precisely so it keeps its place in the queue.
 
-- Self-trade prevention has to cancel *something* — letting the trade through would
-  produce a wash trade, and there is no third option — so the policy is an explicit
+- Self-trade prevention has to cancel *something*: letting the trade through would
+  produce a wash trade, and there is no third option, so the policy is an explicit
   choice rather than a hidden default. `CancelOldest` favours the aggressor and costs
   the participant the queue position they had earned; `CancelNewest` favours the
   resting order, and importantly does **not** rest the cancelled remainder, since
   doing so would leave the participant sitting crossed against their own book.
 - `kNoParticipant` is exempt from self-trade prevention rather than being treated as
   an ordinary id. It means "ownership not modelled", not "everyone is the same
-  person" — without the exemption every unattributed order would block every other
+  person"; without the exemption every unattributed order would block every other
   unattributed order.
 - `MatchingEngine` takes the symbol on *every* operation, cancel and modify included.
   The tempting alternative is a global order-id → symbol index so `cancel(id)` can
   find its own book, but that index has to stay in step with removals the books make
-  on their own — a resting order being filled, or cancelled by self-trade prevention —
+  on their own (a resting order being filled, or cancelled by self-trade prevention),
   which the engine never observes. It would accumulate entries for orders that no
   longer exist and start rejecting ids that are genuinely free. Carrying the symbol
   keeps cancellation O(1) with nothing to synchronise, and is what FIX does. The
@@ -101,27 +101,27 @@ interview, not a black box.
 - Instruments are registered up front instead of created on first use, so a typo'd
   symbol is a rejected order rather than a silently-opened new instrument.
 - The event log stores *requests*, written before they are applied, and stores all of
-  them — including the ones that go on to be rejected. Logging only accepted requests
+  them, including the ones that go on to be rejected. Logging only accepted requests
   would mean knowing the outcome before writing, which means applying first and
   logging second, which is precisely the window a write-ahead log exists to close.
   Replaying the rejected ones is harmless because the engine is deterministic: they
   are rejected again and change nothing. That same determinism is why the log needs
-  no state snapshot — the request sequence *is* the state.
+  no state snapshot: the request sequence *is* the state.
 - `replay()` detaches whatever log is attached to the engine for its duration. A
   restart means replaying a log into an engine that is already logging to that same
   file, and without detaching, every replayed record would be written straight back
-  out — doubling the log on every restart.
+  out, doubling the log on every restart.
 - Records carry a sequence number and replay checks it is contiguous, so a log torn
   by a process dying mid-write stops recovery at the tear instead of feeding a
   half-parsed record to the engine. `EventLog` therefore has to be told which sequence
   number to continue from when appending; restarting the numbering at zero would
   create a gap that all future replays would stop at.
 - A snapshot has to capture resting orders *in queue order*, because time priority
-  isn't derivable from anything else in the record — and registered symbols
+  isn't derivable from anything else in the record, and registered symbols
   separately from their orders, because an instrument with an empty book is still a
   registered instrument. Nothing else is state: trades are outputs, not something the
   engine holds. Re-inserting the orders in snapshot order can't produce trades on the
-  way in, because a resting book is never crossed — no bid in it can cross any ask
+  way in, because a resting book is never crossed: no bid in it can cross any ask
   in it.
 - Compaction writes the snapshot first, renames it into place, and only then discards
   the log. A crash in that window leaves a snapshot at N beside a log that still
@@ -135,11 +135,11 @@ interview, not a black box.
 
 - The wire protocol is length-prefixed because TCP is a byte stream, not a message
   stream: one `read()` can deliver half a message, three messages, or two and a half.
-  Every integer is big-endian and written byte by byte — structs are never memcpy'd
+  Every integer is big-endian and written byte by byte; structs are never memcpy'd
   onto the wire, since their layout depends on the compiler's padding and the host's
   endianness, neither of which is something two independent builds have agreed on.
 - The payload length is `u32`, not `u16`. A 16-bit length caps a response at roughly
-  2000 trades, and one market order sweeping a deep book can exceed that — a limit
+  2000 trades, and one market order sweeping a deep book can exceed that: a limit
   that would only ever surface in production, on the largest and most interesting
   order of the day.
 - The server is single-threaded and that is the design, not a shortcut. Matching is
@@ -148,8 +148,8 @@ interview, not a black box.
   whole operation and have bought nothing. Concurrency belongs at the I/O boundary,
   which is precisely what multiplexing many sockets onto one matching thread gives.
 - Responses are buffered per connection rather than written and assumed sent. A
-  partial write is normal, not an error — the kernel buffer fills and the rest goes
-  out when the socket is writable again — so `POLLOUT` is only requested when there
+  partial write is normal, not an error: the kernel buffer fills and the rest goes
+  out when the socket is writable again, so `POLLOUT` is only requested when there
   is something pending, or `poll()` would return immediately forever.
 
 ## What's deliberately left out (for now)
@@ -157,9 +157,9 @@ interview, not a black box.
 This is a matching core, not a trading system. Missing on purpose, not by oversight:
 
 - Networking / wire protocol (no FIX, no socket layer)
-- Configurable tick size — the tick is a compile-time constant, not a per-instrument
+- Configurable tick size: the tick is a compile-time constant, not a per-instrument
   property, which is fine while there is exactly one instrument
-- Durability against machine failure — the log is flushed to the stream on every
+- Durability against machine failure: the log is flushed to the stream on every
   record, so it survives the process dying, but it is not `fsync`'d, so it does not
   survive the machine dying. Closing that needs a real file descriptor, which is out
   of reach of a `std::ostream`
@@ -177,7 +177,7 @@ This is a matching core, not a trading system. Missing on purpose, not by oversi
   way to ask for "everything since sequence N" -- a gap means re-subscribing for a
   fresh snapshot and picking the sequence back up from there
 - Windows. The server uses POSIX sockets and `poll()`
-- Concurrency — the book is single-threaded by design; a real engine gets its
+- Concurrency: the book is single-threaded by design; a real engine gets its
   concurrency at the I/O boundary, not inside the matching core itself. Per-symbol
   books do make the obvious sharding possible (one thread per instrument, nothing
   shared), but that would be a change to `MatchingEngine`, not a property it has
@@ -236,7 +236,7 @@ LIMIT AAPL BUY 4 98.0 5     -> REJECTED: duplicate order id
 MODIFY AAPL 4 99.0 0        -> REJECTED: quantity must be greater than zero
 ```
 
-Pass a file path and the session becomes durable — every request is logged before
+Pass a file path and the session becomes durable: every request is logged before
 it is applied, and a later run replays it:
 
 ```bash
@@ -262,7 +262,7 @@ The log is plain text, one record per line, prices in ticks:
 2 LIMIT AAPL 2 BUY 10050 4 9
 ```
 
-If a log is torn — a process killed mid-write — recovery stops at the tear and the
+If a log is torn (a process killed mid-write), recovery stops at the tear and the
 CLI refuses to append past it rather than producing a log that would silently stop
 replaying at the same point forever.
 
@@ -317,20 +317,20 @@ Run the benchmark:
 
 It reports two things separately, because they answer different questions:
 
-- **Throughput** — one timer around the whole loop, so per-order clock reads don't
+- **Throughput**: one timer around the whole loop, so per-order clock reads don't
   inflate it.
-- **Latency** — every `addLimitOrder` timed individually, against a book already
+- **Latency**: every `addLimitOrder` timed individually, against a book already
   warmed to a realistic depth rather than an empty one, reported as p50/p90/p99/p99.9
   and max. Percentiles are nearest-rank with no interpolation: every number printed
   is an observation that actually happened.
 
 The cost of two clock reads with no work between them is measured and printed too.
-At these magnitudes it is not a rounding error — it is a meaningful share of the p50,
+At these magnitudes it is not a rounding error: it is a meaningful share of the p50,
 so it is reported rather than quietly folded in.
 
 Read the numbers with the obvious caveats: this is a single-threaded process on a
 general-purpose machine, not pinned to a core, with no isolation from the scheduler
-or from allocator behaviour. The tail shows it — the max is routinely three orders of
+or from allocator behaviour. The tail shows it: the max is routinely three orders of
 magnitude above p99.9, which is the OS and the allocator talking, not the matching
 logic. The percentiles up to p99.9 are the informative part; treat the max as noise
 until it is measured somewhere that can actually control for that.
@@ -344,9 +344,9 @@ The server takes orders over TCP instead of stdin, with the same persistence:
 listening on 127.0.0.1:9001, logging to book.log
 ```
 
-Messages are length-prefixed and big-endian. The header is 12 bytes — payload length
+Messages are length-prefixed and big-endian. The header is 12 bytes: payload length
 (`u32`), correlation id (`u32`, echoed back so a client can match replies to requests
-without assuming ordering), message type, version, and two reserved bytes — followed
+without assuming ordering), message type, version, and two reserved bytes, followed
 by the payload. `wire.hpp` documents each message's layout.
 
 There's an integration test that speaks the protocol from scratch in Python, over a
@@ -468,7 +468,7 @@ class of bug lives: a standard-library symbol used without including its header
 compiles fine under whichever implementation you happened to develop against, and
 fails on the other. Adding CI turned up six such cases in this repository.
 
-`tests/fuzz_wire.cpp` targets `FrameReader` and `decodeRequest` — the only code here
+`tests/fuzz_wire.cpp` targets `FrameReader` and `decodeRequest`, the only code here
 that reads bytes chosen by someone else, since anyone who can open a socket feeds them
 directly. It has two entry points: `LLVMFuzzerTestOneInput` for libFuzzer, and a
 standalone corpus-replay driver so the harness runs under sanitizers on toolchains
@@ -477,10 +477,10 @@ that ship no libFuzzer runtime (Apple clang does not).
 Two details in that setup are load-bearing, and both are the same kind of trap:
 
 - Sanitizer builds pass `-fno-sanitize-recover=all`. UBSan's default is to print a
-  diagnostic and keep going, exiting 0 — so a job built without it stays green while
+  diagnostic and keep going, exiting 0, so a job built without it stays green while
   reporting real undefined behaviour in its own logs.
 - The unit tests use a `CHECK` macro rather than `assert`.   `assert` expands to nothing when `NDEBUG` is defined, and `NDEBUG` is exactly what
-  a CMake `Release` build defines — so an assert-based suite compiled in Release
+  a CMake `Release` build defines, so an assert-based suite compiled in Release
   prints "passed" for every test while verifying nothing. `CHECK` is evaluated in
   every build type.
 
@@ -488,7 +488,7 @@ Both were verified the only way worth trusting: by breaking something on purpose
 confirming the check goes red. Removing a length check from the decoder makes the
 fuzzer abort with an ASan `container-overflow` naming the exact line, and
 reintroducing the `poll()` indexing bug makes the sanitized server report a
-`heap-buffer-overflow` on the first connection — a bug that, uninstrumented, all 60
+`heap-buffer-overflow` on the first connection, a bug that, uninstrumented, all 60
 unit tests passed straight through.
 
 ## Editor setup
