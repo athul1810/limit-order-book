@@ -159,6 +159,7 @@ def clean_env(overrides=None):
     env.pop("MATCHING_ENGINE_MARKET_DATA_HISTORY_LIMIT", None)
     env.pop("MATCHING_ENGINE_TLS_CERT", None)
     env.pop("MATCHING_ENGINE_TLS_KEY", None)
+    env.pop("MATCHING_ENGINE_TLS_HANDSHAKE_TIMEOUT_SECONDS", None)
     if overrides:
         env.update(overrides)
     return env
@@ -617,6 +618,33 @@ def main():
             check("server survives a rejected plaintext connection",
                   read_response(e2)["reason"], "ok")
             e2.close()
+        finally:
+            stop_server(proc, out)
+
+        # A connection that opens a socket and never speaks TLS at all must
+        # not occupy it forever -- MATCHING_ENGINE_TLS_HANDSHAKE_TIMEOUT_SECONDS
+        # bounds it. Its own short-lived server, so the 1-second timeout
+        # below doesn't affect any of the checks above.
+        timeout_port = free_port()
+        timeout_env = {"MATCHING_ENGINE_TLS_CERT": cert_path, "MATCHING_ENGINE_TLS_KEY": key_path,
+                       "MATCHING_ENGINE_TLS_HANDSHAKE_TIMEOUT_SECONDS": "1"}
+        proc, out = start_server(binary, timeout_port, os.path.join(workdir, "tls_timeout.log"),
+                                 os.path.join(workdir, "tls_timeout.out"), env_overrides=timeout_env)
+        try:
+            silent = socket.create_connection(("127.0.0.1", timeout_port), timeout=5)
+            check("a connection that never speaks TLS is dropped after the handshake timeout",
+                  read_after_close_probe(silent, timeout=3), "closed")
+            silent.close()
+
+            # The timeout must never touch a connection that already
+            # finished its handshake, no matter how long it then sits idle.
+            raw = socket.create_connection(("127.0.0.1", timeout_port), timeout=5)
+            established = wrap_tls(raw)
+            time.sleep(1.5)  # past the 1-second handshake timeout
+            established.sendall(add_symbol(1, "AAPL"))
+            check("an established TLS connection is unaffected by the handshake timeout",
+                  read_response(established)["reason"], "ok")
+            established.close()
         finally:
             stop_server(proc, out)
 

@@ -50,9 +50,11 @@ OrderServer::~OrderServer() {
 }
 
 bool OrderServer::enableTls(const std::string& cert_path, const std::string& key_path,
-                           std::string& error) {
+                           std::string& error, std::chrono::steady_clock::duration handshake_timeout) {
     tls_context_ = TlsContext::create(cert_path, key_path, error);
-    return tls_context_ != nullptr;
+    if (tls_context_ == nullptr) return false;
+    tls_handshake_timeout_ = handshake_timeout;
+    return true;
 }
 
 bool OrderServer::listenOn(std::uint16_t port, std::string& error, const std::string& bind_address) {
@@ -165,6 +167,7 @@ void OrderServer::acceptPending() {
                 continue;
             }
             connection.tls_state = Connection::TlsState::Handshaking;
+            connection.handshake_deadline = std::chrono::steady_clock::now() + tls_handshake_timeout_;
         }
         connections_.push_back(std::move(connection));
     }
@@ -482,6 +485,19 @@ void OrderServer::closeConnection(std::size_t index) {
     connections_.erase(connections_.begin() + static_cast<std::ptrdiff_t>(index));
 }
 
+void OrderServer::closeTimedOutHandshakes() {
+    const auto now = std::chrono::steady_clock::now();
+    // Backwards, same reason as runUntilStopped's own connection loop:
+    // closeConnection() erases from connections_, which would disturb any
+    // not-yet-visited index in a forward pass.
+    for (std::size_t i = connections_.size(); i-- > 0;) {
+        if (connections_[i].tls_state == Connection::TlsState::Handshaking &&
+            now >= connections_[i].handshake_deadline) {
+            closeConnection(i);
+        }
+    }
+}
+
 std::uint64_t OrderServer::runUntilStopped() {
     running_ = true;
     std::vector<pollfd> fds;
@@ -513,9 +529,13 @@ std::uint64_t OrderServer::runUntilStopped() {
             break;
         }
 
-        // Runs every iteration -- including a bare timeout with nothing
-        // ready -- so a time-based background trigger still fires on an idle
-        // server, not just a busy one.
+        // Both run every iteration, including a bare timeout with nothing
+        // ready -- for closeTimedOutHandshakes(), that is the case that
+        // actually matters: a connection stuck in its handshake is, by
+        // definition, one poll() has nothing to report on. idle_hook_ is
+        // here for the same reason: a time-based background trigger should
+        // still fire on an idle server, not just a busy one.
+        closeTimedOutHandshakes();
         if (idle_hook_) idle_hook_();
 
         if (ready == 0) continue;

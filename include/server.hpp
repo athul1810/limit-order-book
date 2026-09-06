@@ -115,6 +115,17 @@ class OrderServer {
     // skipped forever.
     void setIdleHook(std::function<void()> hook) { idle_hook_ = std::move(hook); }
 
+    // Bounds how long a connection may sit in its TLS handshake before it is
+    // closed. Without this, a connection that opens a socket and then never
+    // sends a ClientHello (or sends one slowly enough to never finish) would
+    // occupy a connection slot forever -- not a new risk TLS introduces (a
+    // plain connection that connects and never sends anything already does
+    // the same today), but one worth actually bounding now that a
+    // connection has a phase -- the handshake -- with a clear "should be
+    // over by now" of its own, which a plain connection never has.
+    static constexpr std::chrono::steady_clock::duration kDefaultTlsHandshakeTimeout =
+        std::chrono::seconds(10);
+
     // Enables TLS: every connection accepted from here on is wrapped in a
     // server-side handshake before any application byte is read from or
     // written to it. Must be called before listenOn() has accepted anything
@@ -126,7 +137,8 @@ class OrderServer {
     // option; see tls.hpp's tlsSupported()) -- the two are deliberately
     // reported the same way, since both mean "TLS is not available", and a
     // caller's response to either is the same: don't start.
-    bool enableTls(const std::string& cert_path, const std::string& key_path, std::string& error);
+    bool enableTls(const std::string& cert_path, const std::string& key_path, std::string& error,
+                   std::chrono::steady_clock::duration handshake_timeout = kDefaultTlsHandshakeTimeout);
 
    private:
     struct Connection {
@@ -174,6 +186,10 @@ class OrderServer {
         std::unique_ptr<TlsConnection> tls;
         enum class TlsState { Handshaking, Established } tls_state = TlsState::Established;
         TlsWant tls_want = TlsWant::None;
+        // Meaningless outside TlsState::Handshaking. Set once, at accept
+        // time, to now + tls_handshake_timeout_ -- see
+        // closeTimedOutHandshakes(), the only thing that ever reads it.
+        std::chrono::steady_clock::time_point handshake_deadline{};
     };
 
     void acceptPending();
@@ -188,6 +204,12 @@ class OrderServer {
     // serviceReadable/serviceWritable, since a failed handshake is as fatal
     // to a connection as a decode failure is.
     bool driveHandshake(Connection& connection);
+    // Closes every connection still Handshaking whose deadline has passed.
+    // Called once per poll() iteration, including a bare timeout with
+    // nothing ready -- the same unconditional spot idle_hook_ runs from --
+    // since a connection stuck in its handshake, by definition, is one that
+    // is not making poll() report anything ready on its own.
+    void closeTimedOutHandshakes();
     void closeConnection(std::size_t index);
     // Queues a Response carrying only `reason` (no trades, no unfilled) and
     // counts it toward requests_handled_. Used for the outcomes that never
@@ -239,6 +261,10 @@ class OrderServer {
     // Null unless enableTls() has succeeded. Every connection accepted while
     // this is set gets wrapped -- see Connection::tls above.
     std::unique_ptr<TlsContext> tls_context_;
+    // Set by enableTls(); meaningless (never consulted) when tls_context_ is
+    // null. Kept at its default even before enableTls() runs, so there is
+    // never a genuinely uninitialised duration lying around.
+    std::chrono::steady_clock::duration tls_handshake_timeout_ = kDefaultTlsHandshakeTimeout;
     std::vector<Connection> connections_;
     std::atomic<bool> running_{false};
     std::uint64_t requests_handled_ = 0;

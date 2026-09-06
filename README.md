@@ -183,6 +183,12 @@ interview, not a black box.
   above), and a broadcast can append more bytes to that buffer between one write
   attempt and its retry -- exactly the "growing buffer" shape OpenSSL's default,
   stricter contract (retry with the identical pointer and length) doesn't allow.
+- The handshake timeout is checked once per `poll()` iteration, in the same
+  unconditional spot as the idle hook, rather than folded into the per-connection
+  loop just below it. That loop only runs when `poll()` reports something ready,
+  which a connection stuck in its handshake, by definition, never does on its own
+  -- checking it there would mean a silent connection's timeout never actually
+  fires until some unrelated connection happens to wake `poll()` up first.
 
 ## What's deliberately left out (for now)
 
@@ -568,6 +574,13 @@ itself is unaffected, and every other connection keeps working. Nothing about
 authentication, rate limiting, subscriptions, or persistence changes once TLS is on;
 it sits entirely at the transport layer, underneath all of it.
 
+A connection that opens a socket and then never speaks TLS at all -- not a failed
+handshake, no handshake attempt whatsoever -- is dropped after
+`MATCHING_ENGINE_TLS_HANDSHAKE_TIMEOUT_SECONDS` (10 by default), rather than
+occupying a connection slot forever. An established connection is never affected by
+this, no matter how long it then sits idle: the timeout only ever looks at
+connections still mid-handshake.
+
 ## Tests and CI
 
 ```bash
@@ -651,9 +664,5 @@ with more time:
 1. Mutual TLS: the server already presents a certificate; a client could be required
    to present one too, as an alternative or a complement to the shared-token
    authentication that exists today
-2. A handshake timeout. A TLS handshake that never completes occupies a connection
-   slot indefinitely, same as a plain connection that connects and never sends
-   anything already does -- not a new risk TLS introduces, but not one anything
-   times out today either
-3. Reloading a renewed certificate without restarting the process, for a deployment
+2. Reloading a renewed certificate without restarting the process, for a deployment
    that would rather not schedule downtime around a certificate's expiry

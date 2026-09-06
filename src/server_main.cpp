@@ -110,6 +110,13 @@ int main(int argc, char** argv) {
     }
     const bool tls_requested = has_tls_cert && has_tls_key;
 
+    std::chrono::steady_clock::duration tls_handshake_timeout = OrderServer::kDefaultTlsHandshakeTimeout;
+    if (const char* handshake_timeout_env = std::getenv("MATCHING_ENGINE_TLS_HANDSHAKE_TIMEOUT_SECONDS");
+        handshake_timeout_env != nullptr && *handshake_timeout_env != '\0') {
+        const long parsed = std::atol(handshake_timeout_env);
+        if (parsed > 0) tls_handshake_timeout = std::chrono::seconds(parsed);
+    }
+
     MatchingEngine engine;
 
     // Same recovery path as the CLI -- see recovery.hpp. A server that
@@ -145,7 +152,7 @@ int main(int argc, char** argv) {
     // chance of one arriving.
     if (tls_requested) {
         std::string tls_error;
-        if (!server.enableTls(tls_cert_env, tls_key_env, tls_error)) {
+        if (!server.enableTls(tls_cert_env, tls_key_env, tls_error, tls_handshake_timeout)) {
             std::cerr << "cannot enable TLS: " << tls_error << "\n";
             return 1;
         }
