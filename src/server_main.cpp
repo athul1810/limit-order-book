@@ -1,3 +1,4 @@
+#include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
@@ -24,6 +25,20 @@ OrderServer* g_server = nullptr;
 void handleSignal(int) {
     if (g_server != nullptr) g_server->stop();
 }
+
+// Set here, acted on from the idle hook below -- never called directly from
+// the handler. reloadTls() does file I/O and calls into OpenSSL, neither of
+// which is safe inside a signal handler; a single atomic store is all that
+// is, the same reasoning behind handleSignal()/stop() above.
+//
+// Repurposes SIGHUP for this rather than adding a new signal: a server not
+// configured for TLS at all just leaves this flag permanently unread, so
+// SIGHUP stops terminating the process (its default disposition) and
+// instead becomes a silent no-op for it, rather than gaining a second
+// meaning alongside a first one that still applies.
+std::atomic<bool> g_tls_reload_requested{false};
+
+void handleSighup(int) { g_tls_reload_requested = true; }
 
 }  // namespace
 
@@ -173,16 +188,38 @@ int main(int argc, char** argv) {
     // Unlike the CLI, the server has a genuine idle tick (the poll loop's
     // own timeout) independent of request traffic, so a wall-clock trigger
     // here actually fires on a quiet server instead of only when a request
-    // happens to arrive.
-    if (auto_compactor != nullptr && log != nullptr) {
+    // happens to arrive. One hook covers both auto-compaction and a
+    // pending TLS reload -- setIdleHook only keeps the last one it is
+    // given, so anything that needs this "meanwhile" has to share it rather
+    // than each registering its own.
+    const bool auto_compaction_enabled = auto_compactor != nullptr && log != nullptr;
+    if (auto_compaction_enabled || tls_requested) {
         server.setIdleHook([&]() {
-            const auto result =
-                auto_compactor->maybeCompact(engine, snapshot_path, *log, *log_file, log_path);
-            if (!result.has_value()) return;
-            if (result->ok) {
-                std::cout << "auto-compacted at sequence " << result->sequence << "\n";
-            } else {
-                std::cerr << "auto-compaction failed: " << result->error << "\n";
+            if (auto_compaction_enabled) {
+                const auto result =
+                    auto_compactor->maybeCompact(engine, snapshot_path, *log, *log_file, log_path);
+                if (result.has_value()) {
+                    if (result->ok) {
+                        // Flushed, unlike the startup banner's one-time cout
+                        // above: this is status an operator watching the
+                        // log expects to see promptly, not only once the
+                        // process eventually exits and stdio flushes on its
+                        // own.
+                        std::cout << "auto-compacted at sequence " << result->sequence << "\n";
+                        std::cout.flush();
+                    } else {
+                        std::cerr << "auto-compaction failed: " << result->error << "\n";
+                    }
+                }
+            }
+            if (tls_requested && g_tls_reload_requested.exchange(false)) {
+                std::string reload_error;
+                if (server.reloadTls(reload_error)) {
+                    std::cout << "reloaded TLS certificate\n";
+                    std::cout.flush();
+                } else {
+                    std::cerr << "TLS certificate reload failed: " << reload_error << "\n";
+                }
             }
         });
     }
@@ -199,6 +236,7 @@ int main(int argc, char** argv) {
     g_server = &server;
     std::signal(SIGINT, handleSignal);
     std::signal(SIGTERM, handleSignal);
+    std::signal(SIGHUP, handleSighup);
 
     std::cout << "listening on " << bind_address << ":" << server.boundPort();
     if (tls_requested) std::cout << " (TLS enabled)";

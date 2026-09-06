@@ -67,6 +67,14 @@ bool OrderServer::enableTls(const std::string& cert_path, const std::string& key
     return true;
 }
 
+bool OrderServer::reloadTls(std::string& error) {
+    if (tls_context_ == nullptr) {
+        error = "TLS is not enabled on this server";
+        return false;
+    }
+    return tls_context_->reload(error);
+}
+
 bool OrderServer::listenOn(std::uint16_t port, std::string& error, const std::string& bind_address) {
     constexpr const char* kLoopback = "127.0.0.1";
 

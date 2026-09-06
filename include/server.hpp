@@ -149,6 +149,21 @@ class OrderServer {
                    std::chrono::steady_clock::duration handshake_timeout = kDefaultTlsHandshakeTimeout,
                    const std::string& client_ca_path = "");
 
+    // Reloads the certificate (and client CA, if mutual TLS is configured)
+    // from the same paths enableTls() was originally called with, without
+    // restarting the process or dropping any connection already
+    // established -- see TlsContext::reload for exactly what that promises
+    // and how. False (with `error` set) if TLS was never enabled at all, or
+    // if the new files fail to load, in which case whatever certificate was
+    // already in effect keeps being used.
+    //
+    // Not signal-safe: this does file I/O and calls into OpenSSL, neither
+    // of which is safe inside a signal handler. A caller wiring this up to,
+    // say, SIGHUP has to set a flag there and call this from the ordinary
+    // control flow instead -- exactly how stop() and running_ already work,
+    // and exactly what server_main.cpp's idle hook does.
+    bool reloadTls(std::string& error);
+
    private:
     struct Connection {
         int fd = -1;

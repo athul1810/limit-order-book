@@ -50,7 +50,9 @@ interview, not a black box.
   checks isn't sent in plain text off loopback. Off by default, and off entirely
   unless the binary was built with OpenSSL linked in. A connection stuck mid-handshake
   is dropped after a timeout rather than occupying a slot forever, and mutual TLS can
-  require a client certificate as a second, independent layer alongside the token.
+  require a client certificate as a second, independent layer alongside the token. A
+  renewed certificate can be reloaded on `SIGHUP` without restarting the process or
+  dropping a connection already open.
 
 ## Design
 
@@ -196,6 +198,18 @@ interview, not a black box.
   never assigns its `TlsContext` until every piece it was asked to configure has
   actually succeeded, so a caller can't end up running with a quieter security
   posture than it asked for just because one setting among several was wrong.
+- Reloading swaps in an entirely new `SSL_CTX` rather than mutating the existing
+  one in place, and frees the old one immediately rather than keeping it around
+  until every connection using it has closed. Both are safe for the same reason:
+  OpenSSL reference-counts an `SSL_CTX` itself, so `SSL_new()` already took its own
+  reference for every connection wrapped from it, and freeing this object's
+  reference does not touch anything a live connection is still relying on. A
+  reload doesn't have to know or care how many connections exist, or which ones,
+  to be safe.
+- A signal handler is not the place to do file I/O or call into OpenSSL, so
+  `SIGHUP`'s handler only sets an atomic flag, the same pattern `stop()` already
+  uses for `SIGINT`/`SIGTERM`. The actual reload happens from the idle hook,
+  which already runs on ordinary control flow once per `poll()` iteration.
 
 ## What's deliberately left out (for now)
 
@@ -610,6 +624,33 @@ message, arrives back; the rejection reliably surfaces on the first read or writ
 after, not necessarily the handshake call itself. This is a property of the protocol,
 not a delay this server introduces.
 
+#### Reloading a renewed certificate
+
+`SIGHUP` reloads the certificate, private key, and client CA (if mutual TLS is
+configured) from the same paths given at startup, without restarting the process or
+dropping any connection already established:
+
+```bash
+# after replacing cert.pem/key.pem on disk with a renewed pair:
+kill -HUP $(pgrep matching_engine_server)
+reloaded TLS certificate
+```
+
+A connection accepted before the reload keeps whatever certificate it already agreed
+on for as long as it stays open -- a certificate can't change mid-connection, and
+this makes no attempt to pretend otherwise. Only a connection accepted *after* the
+reload sees the new one. If the new files fail to load, the reload is refused and the
+previous certificate stays in effect exactly as before -- a renewal gone wrong must
+never leave the server running with no certificate at all:
+
+```bash
+TLS certificate reload failed: loading certificate 'cert.pem': error:0480006C:PEM routines::no start line
+```
+
+`SIGHUP` is repurposed for this specifically. Its default disposition is to terminate
+the process; a server not configured for TLS at all now just leaves it as a silent
+no-op instead, rather than dying the way it used to.
+
 ## Tests and CI
 
 ```bash
@@ -687,6 +728,5 @@ written and installed before the log is ever touched) instead of reusing it.
 
 ## Roadmap
 
-Every item this section originally listed has since been built. What would come next
-with more time: reloading a renewed certificate without restarting the process, for
-a deployment that would rather not schedule downtime around a certificate's expiry.
+Every item this section has ever listed, from the original set through the ones TLS
+itself surfaced, has since been built. Nothing is currently planned.

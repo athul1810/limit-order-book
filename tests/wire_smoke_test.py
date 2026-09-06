@@ -9,6 +9,7 @@ Run it against a built server:
 """
 import os
 import shutil
+import signal
 import socket
 import ssl
 import struct
@@ -181,6 +182,21 @@ def start_server(binary, port, log_path, out_path, env_overrides=None):
     proc.kill()
     out.close()
     raise RuntimeError(f"server failed to start; see {out_path}")
+
+
+def wait_for_text_in_file(path, text, timeout=3):
+    # Polling rather than a fixed sleep: the idle hook this depends on
+    # (server_main.cpp) runs roughly every kPollTimeoutMs, not on any
+    # schedule this test controls, so a fixed sleep would either be
+    # wastefully long or occasionally too short.
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(path):
+            with open(path) as f:
+                if text in f.read():
+                    return True
+        time.sleep(0.05)
+    return False
 
 
 def stop_server(proc, out):
@@ -737,6 +753,55 @@ def main():
             check("mutual TLS accepts a correctly CA-signed client certificate",
                   read_response(e3)["reason"], "ok")
             e3.close()
+        finally:
+            stop_server(proc, out)
+
+        # ---- certificate reload (SIGHUP) ----
+        reload_cert_path = os.path.join(workdir, "reload_cert.pem")
+        reload_key_path = os.path.join(workdir, "reload_key.pem")
+        generate_self_signed_cert(reload_cert_path, reload_key_path, subject="/CN=reload-v1")
+
+        reload_port = free_port()
+        reload_env = {"MATCHING_ENGINE_TLS_CERT": reload_cert_path, "MATCHING_ENGINE_TLS_KEY": reload_key_path}
+        proc, out = start_server(binary, reload_port, os.path.join(workdir, "reload.log"),
+                                 os.path.join(workdir, "reload.out"), env_overrides=reload_env)
+        try:
+            # Kept open across the reload below, specifically to prove it
+            # survives: getpeercert(binary_form=True) works regardless of
+            # verify_mode, so this compares the actual certificate bytes
+            # rather than just inferring from a successful connection.
+            raw_before = socket.create_connection(("127.0.0.1", reload_port), timeout=5)
+            long_lived = wrap_tls(raw_before)
+            cert_before = long_lived.getpeercert(binary_form=True)
+            long_lived.sendall(add_symbol(1, "AAPL"))
+            check("reload test: pre-reload connection works", read_response(long_lived)["reason"], "ok")
+
+            # Rotate the certificate on disk, in place, then ask the server
+            # to pick it up without restarting.
+            generate_self_signed_cert(reload_cert_path, reload_key_path, subject="/CN=reload-v2")
+            proc.send_signal(signal.SIGHUP)
+            check("reload test: server logs the reload",
+                  wait_for_text_in_file(os.path.join(workdir, "reload.out"), "reloaded TLS certificate"),
+                  True)
+
+            # The connection from before the reload is untouched: still the
+            # old certificate (it can't change mid-connection), still able
+            # to do another full round trip.
+            long_lived.sendall(add_symbol(2, "MSFT"))
+            check("reload test: pre-reload connection survives the reload",
+                  read_response(long_lived)["reason"], "ok")
+            long_lived.close()
+
+            # A fresh connection gets the new certificate -- proven by
+            # comparing actual DER bytes, not just "a connection worked".
+            raw_after = socket.create_connection(("127.0.0.1", reload_port), timeout=5)
+            after = wrap_tls(raw_after)
+            cert_after = after.getpeercert(binary_form=True)
+            after.sendall(add_symbol(3, "NVDA"))
+            check("reload test: post-reload connection works", read_response(after)["reason"], "ok")
+            check("reload test: post-reload connection gets a different certificate",
+                  cert_before != cert_after, True)
+            after.close()
         finally:
             stop_server(proc, out)
 

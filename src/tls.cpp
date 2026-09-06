@@ -43,10 +43,83 @@ int clampToInt(std::size_t length) {
     return static_cast<int>(std::min(length, kMax));
 }
 
+// Builds one complete, freestanding SSL_CTX from disk: certificate, private
+// key, and (only if `client_ca_path` is non-empty) the client-CA
+// verification that requireClientCertificate configures. Shared by create()
+// (which has nothing yet to fall back to) and reload() (which does), so the
+// two can never quietly drift into loading a cert/key/CA combination two
+// different ways. Null on failure, with `error` set; the ctx it already
+// built is freed before returning, so a caller never has to clean up a
+// partial result.
+SSL_CTX* buildContext(const std::string& cert_path, const std::string& key_path,
+                      const std::string& client_ca_path, std::string& error) {
+    SSL_CTX* ctx = SSL_CTX_new(TLS_server_method());
+    if (ctx == nullptr) {
+        error = "SSL_CTX_new failed: " + lastOpenSslError();
+        return nullptr;
+    }
+
+    // No SSLv3/TLS1.0/TLS1.1: all three have known, practical attacks.
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+
+    // Both needed for the outbox-is-a-growing-buffer pattern serviceWritable
+    // (server.cpp) uses: a WANT_WRITE retry there recomputes "from the write
+    // cursor to the current end of outbox" each time, which can be a longer
+    // buffer than the previous attempt if a broadcast queued more bytes in
+    // between. Plain OpenSSL requires retrying with the exact same pointer
+    // and length; ACCEPT_MOVING_WRITE_BUFFER relaxes that to "same pending
+    // bytes at the front, more allowed after them", which is exactly this
+    // shape. ENABLE_PARTIAL_WRITE lets a single SSL_write return less than
+    // asked for instead of internally looping, matching how the raw ::write
+    // path already treats a partial write as normal, not an error.
+    SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+
+    // The chain variant (not SSL_CTX_use_certificate_file) so a cert file
+    // that also bundles intermediate certificates works without a separate
+    // API call for them.
+    if (SSL_CTX_use_certificate_chain_file(ctx, cert_path.c_str()) != 1) {
+        error = "loading certificate '" + cert_path + "': " + lastOpenSslError();
+        SSL_CTX_free(ctx);
+        return nullptr;
+    }
+    if (SSL_CTX_use_PrivateKey_file(ctx, key_path.c_str(), SSL_FILETYPE_PEM) != 1) {
+        error = "loading private key '" + key_path + "': " + lastOpenSslError();
+        SSL_CTX_free(ctx);
+        return nullptr;
+    }
+    if (SSL_CTX_check_private_key(ctx) != 1) {
+        error = "certificate and private key do not match: " + lastOpenSslError();
+        SSL_CTX_free(ctx);
+        return nullptr;
+    }
+
+    if (!client_ca_path.empty()) {
+        if (SSL_CTX_load_verify_locations(ctx, client_ca_path.c_str(), nullptr) != 1) {
+            error = "loading client CA '" + client_ca_path + "': " + lastOpenSslError();
+            SSL_CTX_free(ctx);
+            return nullptr;
+        }
+        // FAIL_IF_NO_PEER_CERT is what actually makes this mandatory rather
+        // than merely requested: without it, VERIFY_PEER alone still
+        // accepts a handshake that presented no certificate at all,
+        // verifying only the ones that were.
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, nullptr);
+    }
+
+    return ctx;
+}
+
 }  // namespace
 
 struct TlsContext::Impl {
     SSL_CTX* ctx = nullptr;
+    // Remembered so reload() can redo exactly what create() and
+    // requireClientCertificate() did, without a caller having to repeat
+    // itself. client_ca_path stays empty unless requireClientCertificate
+    // actually succeeded.
+    std::string cert_path;
+    std::string key_path;
+    std::string client_ca_path;
     ~Impl() {
         if (ctx != nullptr) SSL_CTX_free(ctx);
     }
@@ -70,47 +143,14 @@ struct TlsConnection::Impl {
 
 std::unique_ptr<TlsContext> TlsContext::create(const std::string& cert_path,
                                                const std::string& key_path, std::string& error) {
+    SSL_CTX* ctx = buildContext(cert_path, key_path, "", error);
+    if (ctx == nullptr) return nullptr;
+
     std::unique_ptr<TlsContext> context(new TlsContext());
     context->impl_ = std::make_unique<Impl>();
-
-    context->impl_->ctx = SSL_CTX_new(TLS_server_method());
-    if (context->impl_->ctx == nullptr) {
-        error = "SSL_CTX_new failed: " + lastOpenSslError();
-        return nullptr;
-    }
-    SSL_CTX* ctx = context->impl_->ctx;
-
-    // No SSLv3/TLS1.0/TLS1.1: all three have known, practical attacks.
-    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
-
-    // Both needed for the outbox-is-a-growing-buffer pattern serviceWritable
-    // (server.cpp) uses: a WANT_WRITE retry there recomputes "from the write
-    // cursor to the current end of outbox" each time, which can be a longer
-    // buffer than the previous attempt if a broadcast queued more bytes in
-    // between. Plain OpenSSL requires retrying with the exact same pointer
-    // and length; ACCEPT_MOVING_WRITE_BUFFER relaxes that to "same pending
-    // bytes at the front, more allowed after them", which is exactly this
-    // shape. ENABLE_PARTIAL_WRITE lets a single SSL_write return less than
-    // asked for instead of internally looping, matching how the raw ::write
-    // path already treats a partial write as normal, not an error.
-    SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
-
-    // The chain variant (not SSL_CTX_use_certificate_file) so a cert file
-    // that also bundles intermediate certificates works without a separate
-    // API call for them.
-    if (SSL_CTX_use_certificate_chain_file(ctx, cert_path.c_str()) != 1) {
-        error = "loading certificate '" + cert_path + "': " + lastOpenSslError();
-        return nullptr;
-    }
-    if (SSL_CTX_use_PrivateKey_file(ctx, key_path.c_str(), SSL_FILETYPE_PEM) != 1) {
-        error = "loading private key '" + key_path + "': " + lastOpenSslError();
-        return nullptr;
-    }
-    if (SSL_CTX_check_private_key(ctx) != 1) {
-        error = "certificate and private key do not match: " + lastOpenSslError();
-        return nullptr;
-    }
-
+    context->impl_->ctx = ctx;
+    context->impl_->cert_path = cert_path;
+    context->impl_->key_path = key_path;
     return context;
 }
 
@@ -121,11 +161,26 @@ bool TlsContext::requireClientCertificate(const std::string& ca_path, std::strin
         error = "loading client CA '" + ca_path + "': " + lastOpenSslError();
         return false;
     }
-    // FAIL_IF_NO_PEER_CERT is what actually makes this mandatory rather than
-    // merely requested: without it, VERIFY_PEER alone still accepts a
-    // handshake that presented no certificate at all, verifying only the
-    // ones that were.
     SSL_CTX_set_verify(impl_->ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, nullptr);
+    // Remembered for reload(), which rebuilds a context from scratch and so
+    // needs to know this was configured at all -- an empty client_ca_path
+    // there means "mutual TLS was never turned on", not "turn it off".
+    impl_->client_ca_path = ca_path;
+    return true;
+}
+
+bool TlsContext::reload(std::string& error) {
+    SSL_CTX* new_ctx = buildContext(impl_->cert_path, impl_->key_path, impl_->client_ca_path, error);
+    if (new_ctx == nullptr) return false;  // impl_->ctx untouched: still serving the old certificate
+
+    // Safe to free immediately, even with connections already wrap()ped
+    // from the old one: SSL_new() takes its own reference on the SSL_CTX it
+    // is given, so SSL_CTX_free() here only releases *this* TlsContext's
+    // reference. The underlying object is not actually destroyed until the
+    // last SSL object created from it is freed too -- exactly the "existing
+    // connections are never disrupted" guarantee this method promises.
+    SSL_CTX_free(impl_->ctx);
+    impl_->ctx = new_ctx;
     return true;
 }
 
@@ -239,6 +294,11 @@ TlsContext::~TlsContext() = default;
 
 bool TlsContext::requireClientCertificate(const std::string& ca_path, std::string& error) {
     (void)ca_path;
+    error = "this binary was not built with TLS support (rebuild with -DWITH_TLS=ON)";
+    return false;
+}
+
+bool TlsContext::reload(std::string& error) {
     error = "this binary was not built with TLS support (rebuild with -DWITH_TLS=ON)";
     return false;
 }

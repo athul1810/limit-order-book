@@ -82,6 +82,21 @@ class TlsContext {
     // since those are two different claims.
     bool requireClientCertificate(const std::string& ca_path, std::string& error);
 
+    // Reloads the certificate, private key, and (if requireClientCertificate
+    // was used) client CA from the same paths originally given, replacing
+    // what every connection wrap()ped from this point on will present or
+    // check. False (with `error` set) if the new files can't be loaded --
+    // on failure, the previous certificate is still in effect, exactly as
+    // if reload() had never been called; a bad renewal must never leave the
+    // server running with no certificate at all.
+    //
+    // Never disrupts a connection already wrap()ped: each holds its own
+    // independent OpenSSL state once created, unaffected by anything this
+    // TlsContext does afterwards. A reload only changes what happens on the
+    // *next* accept() -- existing connections keep talking under whichever
+    // certificate they started with until they eventually close.
+    bool reload(std::string& error);
+
    private:
     TlsContext() = default;
     struct Impl;
